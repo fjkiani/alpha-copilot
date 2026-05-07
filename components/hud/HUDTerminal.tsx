@@ -1,36 +1,44 @@
 /**
- * HUDTerminal — Coding phase renderer
- * Renders: [ALGORITHM] → [COMPLEXITY] → [EDGE CASES] → [THE CODE]
- * (This was missing from assembly-ai-tts-v2 — BUG-12 fixed here)
+ * HUDTerminal — Coding phase renderer (tank-grade)
+ * Adds [OPTIMIZE] section from upgraded code agent.
  */
+'use client';
+
 import { parseSegments, type HUDParsed } from '@/lib/parseHUD';
 import RenderSegments from './RenderSegments';
 
 export default function HUDTerminal({ parsed }: { parsed: HUDParsed }) {
+  const ext = parsed as HUDParsed & { optimize?: string };
   return (
-    <div className="space-y-2 border-l-2 border-cyan-500 pl-3">
+    <div className="space-y-3">
       {parsed.algorithm && (
-        <div>
+        <div className="animate-fade-in-up" style={{ animationDelay: '0ms', animationFillMode: 'both' }}>
           <span className="text-xs font-semibold text-cyan-400 uppercase tracking-wider">Algorithm</span>
-          <p className="text-sm text-cyan-200 mt-0.5 font-medium">{parsed.algorithm}</p>
+          <p className="text-sm text-cyan-200 mt-0.5 font-medium leading-snug">{parsed.algorithm}</p>
         </div>
       )}
       {parsed.complexity && (
-        <div>
+        <div className="animate-fade-in-up" style={{ animationDelay: '60ms', animationFillMode: 'both' }}>
           <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Complexity</span>
           <p className="text-sm text-zinc-300 mt-0.5 font-mono">{parsed.complexity}</p>
         </div>
       )}
       {parsed.edgeCases && (
-        <div>
+        <div className="animate-fade-in-up" style={{ animationDelay: '120ms', animationFillMode: 'both' }}>
           <span className="text-xs font-semibold text-yellow-400 uppercase tracking-wider">Edge Cases</span>
           <RenderSegments segments={parseSegments(parsed.edgeCases)} className="mt-1" />
         </div>
       )}
       {parsed.code && (
-        <div>
+        <div className="animate-fade-in-up" style={{ animationDelay: '180ms', animationFillMode: 'both' }}>
           <span className="text-xs font-semibold text-green-400 uppercase tracking-wider">The Code</span>
           <RenderSegments segments={parseSegments(parsed.code)} className="mt-1" />
+        </div>
+      )}
+      {ext.optimize && (
+        <div className="animate-fade-in-up" style={{ animationDelay: '240ms', animationFillMode: 'both' }}>
+          <span className="text-xs font-semibold text-purple-400 uppercase tracking-wider">Optimize</span>
+          <p className="text-sm text-purple-200 mt-0.5">{ext.optimize}</p>
         </div>
       )}
     </div>

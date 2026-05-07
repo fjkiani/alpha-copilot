@@ -1,7 +1,90 @@
+/**
+ * POST /api/stream
+ * Tank-grade SSE streaming agent endpoint.
+ *
+ * Upgrades vs v1:
+ * - Knowledge base injected into system prompt dynamically
+ * - ProfilerState injected per-call for context-aware responses
+ * - Per-agent system prompt built from buildSystemPrompt.ts (not flat strings)
+ * - Request deduplication: identical transcript+agent within 500ms is dropped
+ * - Timeout guard: 8s hard limit on upstream fetch
+ * - Truncation detection: signals client if response was cut off
+ */
 import { NextRequest } from 'next/server';
 import { AGENT_CONFIGS, AgentId } from '@/lib/agentConfigs';
+import {
+  buildTacticalPrompt,
+  buildTerminalModePrompt,
+  buildRescuePrompt,
+  buildFollowUpPrompt,
+  type KnowledgeBase,
+  type ProfilerState,
+  type ClientTelemetry,
+} from '@/lib/buildSystemPrompt';
+import KB_RAW from '@/lib/knowledge_base.json';
 
 export const runtime = 'edge';
+
+const kb = KB_RAW as unknown as KnowledgeBase;
+
+// ── Deduplication store (edge-scoped, resets per cold start) ──────────────────
+const recentRequests = new Map<string, number>();
+const DEDUP_WINDOW_MS = 500;
+
+function isDuplicate(key: string): boolean {
+  const now = Date.now();
+  const last = recentRequests.get(key);
+  if (last && now - last < DEDUP_WINDOW_MS) return true;
+  recentRequests.set(key, now);
+  // Prune old entries
+  if (recentRequests.size > 100) {
+    for (const [k, t] of recentRequests.entries()) {
+      if (now - t > 5000) recentRequests.delete(k);
+    }
+  }
+  return false;
+}
+
+// ── System prompt builder — wires KB + profilerState into each agent ──────────
+function buildSystemPromptForAgent(
+  agentId: AgentId,
+  profilerState: ProfilerState | null,
+  clientTelemetry: ClientTelemetry,
+  speaker: string
+): string {
+  // For agents that have rich KB-aware prompts, use buildSystemPrompt.ts
+  switch (agentId) {
+    case 'tactical':
+    case 'behavioral':
+      return buildTacticalPrompt(kb, profilerState, clientTelemetry, speaker);
+    case 'code':
+      return buildTerminalModePrompt(kb);
+    case 'rescue':
+      return buildRescuePrompt(kb);
+    default:
+      // sales, demo, negotiation — use agentConfigs system string (already good)
+      return AGENT_CONFIGS[agentId]?.system ?? '';
+  }
+}
+
+// ── KB context block injected into user message ───────────────────────────────
+function buildKBContext(profilerState: ProfilerState | null): string {
+  const pillars = kb.candidate?.campaign_pillars ?? [];
+  const stats = (kb.playbook as { power_stats?: string[] })?.power_stats ?? [];
+  const phase = profilerState?.conversation_phase ?? 'unknown';
+  const interviewers = profilerState?.interviewers ?? [];
+
+  const interviewerBlock = interviewers.length > 0
+    ? `\n[LIVE PROFILER INTEL]:\n${interviewers.map(i =>
+        `  ${i.name ?? 'Interviewer'}: ${i.emotional_state ?? 'unknown'} | exploit: ${i.the_exploit ?? 'none detected'}`
+      ).join('\n')}`
+    : '';
+
+  return `[CANDIDATE]: ${kb.candidate?.name ?? 'Unknown'} | ${kb.candidate?.current_role ?? 'N/A'}
+[PHASE]: ${phase}
+[POWER STATS]: ${stats.slice(0, 5).join(' | ')}
+[CAMPAIGN PILLARS]: ${pillars.join(' | ')}${interviewerBlock}`;
+}
 
 export async function POST(req: NextRequest) {
   let body: {
@@ -10,6 +93,9 @@ export async function POST(req: NextRequest) {
     mode: string;
     problem_context: string;
     turn_history: Array<{ role: string; content: string }>;
+    profiler_state?: ProfilerState | null;
+    speaker?: string;
+    client_telemetry?: ClientTelemetry;
   };
 
   try {
@@ -18,20 +104,44 @@ export async function POST(req: NextRequest) {
     return new Response('Invalid JSON', { status: 400 });
   }
 
-  const { agent, transcript, mode, problem_context, turn_history } = body;
+  const {
+    agent,
+    transcript,
+    mode,
+    problem_context,
+    turn_history,
+    profiler_state = null,
+    speaker = 'interviewer',
+    client_telemetry = {},
+  } = body;
+
+  // Deduplication
+  const dedupKey = `${agent}:${transcript.slice(0, 80)}`;
+  if (isDuplicate(dedupKey)) {
+    return new Response(null, { status: 204 }); // No Content — silently drop
+  }
 
   const config = AGENT_CONFIGS[agent];
   if (!config) {
     return new Response(`Unknown agent: ${agent}`, { status: 400 });
   }
 
+  // Build system prompt — KB-aware, profiler-injected
+  const systemPrompt = buildSystemPromptForAgent(agent, profiler_state, client_telemetry, speaker);
+
+  // Build user message with KB context block
+  const kbContext = buildKBContext(profiler_state);
+  const userContent = `${kbContext}
+
+[MODE]: ${mode}
+[ACTIVE CONTEXT]: ${(problem_context ?? '').slice(0, 400)}
+[SPEAKER]: ${speaker.toUpperCase()}
+[LIVE TRANSCRIPT]: ${transcript}`;
+
   const messages = [
-    { role: 'system', content: config.system },
-    ...(turn_history ?? []).slice(-5),
-    {
-      role: 'user',
-      content: `[MODE]: ${mode}\n[ACTIVE PROBLEM]: ${problem_context ?? ''}\n[LIVE TRANSCRIPT]: ${transcript}`,
-    },
+    { role: 'system', content: systemPrompt || config.system },
+    ...(turn_history ?? []).slice(-6), // last 3 pairs
+    { role: 'user', content: userContent },
   ];
 
   const requestBody: Record<string, unknown> = {
@@ -42,10 +152,13 @@ export async function POST(req: NextRequest) {
     stream: true,
   };
 
-  // Only add reasoning for agents that need it (rescue mode)
   if (config.reasoning) {
     requestBody.reasoning = config.reasoning;
   }
+
+  // ── Upstream fetch with timeout ───────────────────────────────────────────
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
 
   let upstream: Response;
   try {
@@ -58,29 +171,32 @@ export async function POST(req: NextRequest) {
         'X-Title': 'Alpha Copilot',
       },
       body: JSON.stringify(requestBody),
+      signal: controller.signal,
     });
   } catch (err) {
-    console.error('[stream] OpenRouter fetch failed:', err);
-    return new Response('OpenRouter unreachable', { status: 502 });
+    clearTimeout(timeoutId);
+    const isTimeout = (err as Error).name === 'AbortError';
+    console.error('[stream] OpenRouter fetch failed:', isTimeout ? 'TIMEOUT' : err);
+    return new Response(isTimeout ? 'OpenRouter timeout' : 'OpenRouter unreachable', { status: 502 });
   }
+  clearTimeout(timeoutId);
 
-  // Pre-stream errors (401, 402, 429, 503) come back as non-200 before any tokens
   if (!upstream.ok) {
     const errText = await upstream.text();
     console.error('[stream] OpenRouter pre-stream error:', upstream.status, errText);
-
-    // 429 on free model → tell client to retry with paid fallback
     if (upstream.status === 429) {
       return new Response(
-        JSON.stringify({ error: 'rate_limited', fallback: 'qwen/qwen-plus-2025-07-28' }),
+        JSON.stringify({ error: 'rate_limited' }),
         { status: 429, headers: { 'Content-Type': 'application/json' } }
       );
     }
-
     return new Response(`OpenRouter error: ${upstream.status}`, { status: 502 });
   }
 
+  // ── SSE output stream ─────────────────────────────────────────────────────
   const encoder = new TextEncoder();
+  let tokenCount = 0;
+  const TOKEN_WARN_THRESHOLD = Math.floor(config.max_tokens * 0.92);
 
   const outputStream = new ReadableStream({
     async start(controller) {
@@ -99,49 +215,52 @@ export async function POST(req: NextRequest) {
 
           buffer += decoder.decode(value, { stream: true });
 
-          // Process all complete lines in buffer
           while (true) {
             const lineEnd = buffer.indexOf('\n');
             if (lineEnd === -1) break;
-
             const line = buffer.slice(0, lineEnd).trim();
             buffer = buffer.slice(lineEnd + 1);
 
-            // Skip OpenRouter keepalive comments (": OPENROUTER PROCESSING")
             if (line.startsWith(':') || line === '') continue;
-
             if (!line.startsWith('data: ')) continue;
 
             const data = line.slice(6);
             if (data === '[DONE]') {
-              send({ type: 'done' });
+              send({ type: 'done', token_count: tokenCount });
               controller.close();
               return;
             }
 
             let parsed: Record<string, unknown>;
-            try {
-              parsed = JSON.parse(data);
-            } catch {
-              continue; // malformed chunk, skip
-            }
+            try { parsed = JSON.parse(data); } catch { continue; }
 
-            // Mid-stream error from OpenRouter
             if (parsed.error) {
               const errMsg = (parsed.error as { message?: string })?.message ?? 'Unknown stream error';
-              console.error('[stream] Mid-stream error:', errMsg);
               send({ type: 'error', message: errMsg });
               controller.close();
               return;
             }
 
-            // Skip reasoning_details chunks (thinking tokens) — not shown to user
-            const delta = (parsed.choices as Array<{ delta: Record<string, unknown> }>)?.[0]?.delta;
+            const delta = (parsed.choices as Array<{ delta: Record<string, unknown>; finish_reason?: string }>)?.[0];
             if (!delta) continue;
-            if (delta.reasoning_details) continue; // thinking tokens, skip
 
-            const content = delta.content as string | undefined;
+            // Detect finish_reason=length (truncated by token limit)
+            if (delta.finish_reason === 'length') {
+              send({ type: 'truncated', message: 'Response reached token limit' });
+              send({ type: 'done', token_count: tokenCount });
+              controller.close();
+              return;
+            }
+
+            if (delta.delta?.reasoning_details) continue; // skip thinking tokens
+
+            const content = delta.delta?.content as string | undefined;
             if (content) {
+              tokenCount++;
+              // Warn client approaching limit
+              if (tokenCount === TOKEN_WARN_THRESHOLD) {
+                send({ type: 'approaching_limit' });
+              }
               send({ type: 'chunk', content });
             }
           }

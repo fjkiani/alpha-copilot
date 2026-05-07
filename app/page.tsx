@@ -1,28 +1,20 @@
 /**
- * Alpha Copilot — Unified Orchestrator
+ * Alpha Copilot — Tank-grade Unified Orchestrator
  *
- * Single app. AssemblyAI STT → OpenRouter LLM → HUD.
- *
- * Architecture:
- *   useTranscription (AssemblyAI WS + audio pipeline + profiler)
- *     └─ onFire → useAlpha.process (OpenRouter route → stream)
- *   useAlpha owns: rawResponse, bulletHistory, copilotLatency, activeQuestion
- *   useTranscription owns: transcripts, partialText, status, profilerState
- *
- * Keyboard shortcuts:
- *   SPACE     → SOS Rescue (handled in useTranscription)
- *   ESC       → Toggle cover mode
- *   Ctrl+Shift+S → Toggle auto-stealth
- *   Backspace/Delete → Burn active context
- *
- * Bug fixes vs v1:
- *   BUG-A: onFire no longer reads alphaState.insight (stale closure).
- *          useAlpha.process() now returns the completed insight string directly.
- *          bulletHistory is built from the return value, not from state.
- *   BUG-B: copilotFiringRef.current = true set SYNCHRONOUSLY at top of onFire,
- *          not via useEffect (which runs one render late).
- *   BUG-C: alphaState.insight removed from onFire deps — no more spurious
- *          flush recreation on every stream completion.
+ * Upgrades vs v1:
+ * - profilerState passed to process() for KB-aware, context-injected responses
+ * - Full keyboard command system (SPACE, ESC, P, H, T, R, N, B, 1/2/3, ?, Ctrl+C)
+ * - Profiler panel (P key) with real-time phase detection
+ * - HUD visibility toggle (H key)
+ * - Force-agent keys (T=terminal, R=rescue, N=negotiation, B=behavioral)
+ * - Bullet highlight mode (1/2/3 keys)
+ * - Ctrl+C copies current HUD to clipboard
+ * - Smarter auto-stealth: 3s blur delay, not instant
+ * - Session start time tracked for StatusBar timer
+ * - currentAgent passed to StatusBar
+ * - TurnMeta (agent, confidence, latency, truncated) stored in bulletHistory
+ * - HotkeyOverlay (? key)
+ * - Rescue overlay dismissal (SPACE or ESC when rescue active)
  */
 'use client';
 
@@ -30,6 +22,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAlpha } from '@/hooks/useAlpha';
 import { useTranscription } from '@/hooks/useTranscription';
 import type { SpeakerRole } from '@/hooks/useTranscriptProcessor';
+import type { TurnMeta } from '@/components/ConversationTurn';
 
 import CoverPage from '@/components/CoverPage';
 import RamblingBanner from '@/components/RamblingBanner';
@@ -37,15 +30,18 @@ import StatusBar from '@/components/StatusBar';
 import ControlBar from '@/components/ControlBar';
 import CapabilityPanel, { type Capabilities } from '@/components/CapabilityPanel';
 import SessionSetup, { type SessionContext } from '@/components/SessionSetup';
-import HistoricalThread from '@/components/HistoricalThread';
+import HistoricalThread, { type HistoryEntry } from '@/components/HistoricalThread';
 import ActiveTurn from '@/components/ActiveTurn';
 import FollowUpPanel from '@/components/FollowUpPanel';
+import ProfilerPanel, { detectPhaseFromTranscript } from '@/components/ProfilerPanel';
+import HotkeyOverlay from '@/components/HotkeyOverlay';
 import { ModeSelector } from '@/components/ModeSelector';
 
 type Mode = 'interview' | 'sales' | 'demo';
+type ForceAgent = 'terminal' | 'rescue' | 'negotiation' | 'behavioral' | null;
 
 export default function AlphaPage() {
-  // ── Mode & capabilities ──
+  // ── Mode & capabilities ──────────────────────────────────────────────────
   const [mode, setMode] = useState<Mode>('interview');
   const [capabilities, setCapabilities] = useState<Capabilities>({
     terminalMode: false,
@@ -57,24 +53,30 @@ export default function AlphaPage() {
   });
   const [modesOpen, setModesOpen] = useState(false);
   const [sessionContext, setSessionContext] = useState<SessionContext | null>(null);
+
+  // ── UI state ─────────────────────────────────────────────────────────────
   const [coverMode, setCoverMode] = useState(false);
+  const [showProfiler, setShowProfiler] = useState(false);
+  const [showHUD, setShowHUD] = useState(true);
+  const [showHotkeys, setShowHotkeys] = useState(false);
+  const [forceAgent, setForceAgent] = useState<ForceAgent>(null);
+  const [highlightBullet, setHighlightBullet] = useState<number | null>(null);
+  const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
 
   const toggleCapability = useCallback((key: keyof Capabilities) => {
-    setCapabilities((prev) => ({ ...prev, [key]: !prev[key] }));
+    setCapabilities(prev => ({ ...prev, [key]: !prev[key] }));
   }, []);
 
-  // ── Alpha LLM hook (OpenRouter) ──
+  // ── Alpha LLM hook ───────────────────────────────────────────────────────
   const { state: alphaState, process, dismiss, reset: resetAlpha } = useAlpha(mode);
 
-  // ── BUG-B FIX: copilotFiringRef set synchronously in onFire, not via useEffect ──
-  // useEffect runs after render — too late to block the debounce gate from double-firing.
-  // We still sync from alphaState.isStreaming for the case where process() is cancelled
-  // externally (dismiss()), but the primary guard is the synchronous set in onFire.
+  // Sync refs for gate integration (BUG-B fix: set synchronously in onFire)
   const copilotFiringRef = useRef(false);
   const lastCopilotOutputRef = useRef('');
+  const forceAgentRef = useRef<ForceAgent>(null);
+  forceAgentRef.current = forceAgent;
 
   useEffect(() => {
-    // Sync for external cancellation (dismiss button, pause, etc.)
     copilotFiringRef.current = alphaState.isStreaming;
   }, [alphaState.isStreaming]);
 
@@ -84,43 +86,46 @@ export default function AlphaPage() {
     }
   }, [alphaState.isStreaming, alphaState.insight]);
 
-  // ── Bullet history — owned here, not in useAlpha ──
-  const bulletHistoryRef = useRef<Array<{
-    question: string;
-    bullets: string[];
-    rawResponse: string;
-    latency: number;
-    timestamp: number;
-  }>>([]);
-  const [bulletHistory, setBulletHistory] = useState(bulletHistoryRef.current);
-
-  // Active question for display during streaming
+  // ── Bullet history ───────────────────────────────────────────────────────
+  const bulletHistoryRef = useRef<HistoryEntry[]>([]);
+  const [bulletHistory, setBulletHistory] = useState<HistoryEntry[]>([]);
   const [activeQuestion, setActiveQuestion] = useState('');
 
-  // ── BUG-A FIX: onFire reads insight from process() return value, not alphaState ──
-  // BUG-C FIX: alphaState.insight removed from deps — no stale closure, no spurious flush reset
+  // profilerState ref — allows onFire to read latest value without being in deps
+  // (profilerState is declared after onFire via useTranscription, so we use a ref bridge)
+  const profilerStateRef = useRef<import('@/lib/buildSystemPrompt').ProfilerState | null>(null);
+
+  // ── onFire — the STT→LLM integration seam ───────────────────────────────
   const onFire = useCallback(
     async (text: string, speaker: SpeakerRole) => {
-      // BUG-B FIX: set synchronously BEFORE await — blocks gate from double-firing
+      // BUG-B fix: synchronous guard
       copilotFiringRef.current = true;
-
       setActiveQuestion(text);
       const t0 = Date.now();
 
-      // process() returns the completed insight string (see useAlpha patch below)
       const completedInsight = await process(
         { text, speaker: speaker === 'candidate' ? 'CANDIDATE' : 'INTERVIEWER', timestamp: t0 },
-        ''
+        '',
+        { profilerState: profilerStateRef.current, isRambling: false }
       );
 
-      // BUG-A FIX: use the return value, not alphaState.insight (which is stale here)
       if (completedInsight) {
-        const entry = {
-          question: text,
-          bullets: completedInsight.split('\n').filter(Boolean),
-          rawResponse: completedInsight,
-          latency: Date.now() - t0,
+        const meta: TurnMeta = {
+          agent: alphaState.agent || 'tactical',
+          urgency: alphaState.urgency,
+          confidence: undefined, // router confidence not surfaced yet — future
+          firstTokenMs: alphaState.latency.firstTokenMs,
+          truncated: alphaState.truncated,
           timestamp: Date.now(),
+          latencyMs: Date.now() - t0,
+        };
+        const entry: HistoryEntry = {
+          question: text,
+          rawResponse: completedInsight,
+          bullets: completedInsight.split('\n').filter(Boolean),
+          timestamp: Date.now(),
+          latency: Date.now() - t0,
+          meta,
         };
         bulletHistoryRef.current = [...bulletHistoryRef.current, entry];
         setBulletHistory([...bulletHistoryRef.current]);
@@ -128,13 +133,11 @@ export default function AlphaPage() {
       }
 
       setActiveQuestion('');
-      // copilotFiringRef.current will be set to false by the useEffect above
-      // when alphaState.isStreaming flips to false after process() completes
     },
-    [process] // BUG-C FIX: alphaState.insight removed from deps
+    [process, alphaState.agent, alphaState.urgency, alphaState.latency.firstTokenMs, alphaState.truncated] // BUG-C: no alphaState.insight
   );
 
-  // ── Transcription hook (AssemblyAI) ──
+  // ── Transcription hook ───────────────────────────────────────────────────
   const {
     isStreaming,
     transcripts,
@@ -168,7 +171,16 @@ export default function AlphaPage() {
     },
   });
 
-  // ── Follow-up generator ──
+  // Keep profilerStateRef in sync so onFire always reads latest value
+  useEffect(() => { profilerStateRef.current = profilerState; }, [profilerState]);
+
+  // Track session start time for StatusBar timer
+  useEffect(() => {
+    if (isStreaming && !sessionStartTime) setSessionStartTime(Date.now());
+    if (!isStreaming) setSessionStartTime(null);
+  }, [isStreaming, sessionStartTime]);
+
+  // ── Follow-up generator ──────────────────────────────────────────────────
   const [followUp, setFollowUp] = useState('');
   const [followUpLoading, setFollowUpLoading] = useState(false);
 
@@ -223,19 +235,36 @@ export default function AlphaPage() {
     });
   }, [followUp]);
 
-  // ── Mode change ──
-  const handleModeChange = useCallback(
-    (m: Mode) => {
-      if (isStreaming) stop();
-      resetAlpha();
-      bulletHistoryRef.current = [];
-      setBulletHistory([]);
-      setMode(m);
-    },
-    [isStreaming, stop, resetAlpha]
-  );
+  // ── Copy current HUD to clipboard ────────────────────────────────────────
+  const copyCurrentHUD = useCallback(() => {
+    const latest = bulletHistoryRef.current[bulletHistoryRef.current.length - 1];
+    if (!latest) return;
+    const text = `Q: ${latest.question}\n\n${latest.rawResponse}`;
+    navigator.clipboard.writeText(text).catch(() => {});
+  }, []);
 
-  // ── Auto-scroll ──
+  // ── Mode change ──────────────────────────────────────────────────────────
+  const handleModeChange = useCallback((m: Mode) => {
+    if (isStreaming) stop();
+    resetAlpha();
+    bulletHistoryRef.current = [];
+    setBulletHistory([]);
+    setMode(m);
+  }, [isStreaming, stop, resetAlpha]);
+
+  // ── Profiler export ──────────────────────────────────────────────────────
+  const exportProfiler = useCallback(() => {
+    const data = JSON.stringify({ profilerState, transcripts: transcripts.slice(-20) }, null, 2);
+    const blob = new Blob([data], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `alpha-profiler-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [profilerState, transcripts]);
+
+  // ── Auto-scroll ──────────────────────────────────────────────────────────
   const threadRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
 
@@ -243,55 +272,96 @@ export default function AlphaPage() {
     const node = threadRef.current;
     if (!node) return;
     const onScroll = () => {
-      const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
-      shouldAutoScrollRef.current = distanceFromBottom < 80;
+      shouldAutoScrollRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80;
     };
     node.addEventListener('scroll', onScroll, { passive: true });
-    onScroll();
     return () => node.removeEventListener('scroll', onScroll);
   }, []);
 
   useEffect(() => {
-    if (!threadRef.current) return;
-    if (shouldAutoScrollRef.current) {
+    if (threadRef.current && shouldAutoScrollRef.current) {
       threadRef.current.scrollTop = threadRef.current.scrollHeight;
     }
   }, [bulletHistory, alphaState.insight, partialText]);
 
-  // ── Keyboard shortcuts ──
-  const handleKeyDown = useCallback(
-    (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setCoverMode((m) => !m);
-      if (e.ctrlKey && e.shiftKey && e.code === 'KeyS') {
-        e.preventDefault();
-        toggleCapability('autoStealth');
-      }
-      if (
-        (e.code === 'Backspace' || e.code === 'Delete') &&
-        e.target === document.body
-      ) {
-        e.preventDefault();
-        flushActiveContext();
-      }
-    },
-    [toggleCapability, flushActiveContext]
-  );
+  // ── Keyboard command system ──────────────────────────────────────────────
+  const stealthTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    const inInput = e.target instanceof HTMLInputElement
+      || e.target instanceof HTMLTextAreaElement
+      || (e.target as HTMLElement).isContentEditable;
+
+    // Global: ESC always works
+    if (e.key === 'Escape') {
+      if (showHotkeys) { setShowHotkeys(false); return; }
+      if (alphaState.urgency === 'rescue') { dismiss(); return; }
+      setCoverMode(m => !m);
+      return;
+    }
+
+    if (inInput) return;
+
+    // ? = hotkey overlay
+    if (e.key === '?') { e.preventDefault(); setShowHotkeys(m => !m); return; }
+
+    // P = profiler panel
+    if (e.key === 'p' || e.key === 'P') { e.preventDefault(); setShowProfiler(m => !m); return; }
+
+    // H = toggle HUD
+    if (e.key === 'h' || e.key === 'H') { e.preventDefault(); setShowHUD(m => !m); return; }
+
+    // Force agent keys
+    if (e.key === 't' || e.key === 'T') { e.preventDefault(); setForceAgent(a => a === 'terminal' ? null : 'terminal'); return; }
+    if (e.key === 'r' || e.key === 'R') { e.preventDefault(); setForceAgent(a => a === 'rescue' ? null : 'rescue'); return; }
+    if (e.key === 'n' || e.key === 'N') { e.preventDefault(); setForceAgent(a => a === 'negotiation' ? null : 'negotiation'); return; }
+    if (e.key === 'b' || e.key === 'B') { e.preventDefault(); setForceAgent(a => a === 'behavioral' ? null : 'behavioral'); return; }
+
+    // Bullet highlight
+    if (e.key === '1') { e.preventDefault(); setHighlightBullet(h => h === 0 ? null : 0); return; }
+    if (e.key === '2') { e.preventDefault(); setHighlightBullet(h => h === 1 ? null : 1); return; }
+    if (e.key === '3') { e.preventDefault(); setHighlightBullet(h => h === 2 ? null : 2); return; }
+
+    // Ctrl+C = copy HUD
+    if (e.ctrlKey && e.key === 'c') { copyCurrentHUD(); return; }
+
+    // Ctrl+Shift+S = toggle auto-stealth
+    if (e.ctrlKey && e.shiftKey && e.code === 'KeyS') { e.preventDefault(); toggleCapability('autoStealth'); return; }
+
+    // Backspace/Delete = burn context
+    if ((e.code === 'Backspace' || e.code === 'Delete') && e.target === document.body) {
+      e.preventDefault(); flushActiveContext(); return;
+    }
+  }, [showHotkeys, alphaState.urgency, dismiss, copyCurrentHUD, toggleCapability, flushActiveContext]);
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
 
-  // ── Auto-stealth ──
+  // ── Auto-stealth (3s delay, not instant) ────────────────────────────────
   useEffect(() => {
     if (!capabilities.autoStealth) return;
-    const handleBlur = () => setCoverMode(true);
-    const handleFocus = () => setCoverMode(false);
-    const handleVis = () => setCoverMode(document.hidden);
+    const handleBlur = () => {
+      stealthTimerRef.current = setTimeout(() => setCoverMode(true), 3000);
+    };
+    const handleFocus = () => {
+      if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
+      setCoverMode(false);
+    };
+    const handleVis = () => {
+      if (document.hidden) {
+        stealthTimerRef.current = setTimeout(() => setCoverMode(true), 3000);
+      } else {
+        if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
+        setCoverMode(false);
+      }
+    };
     window.addEventListener('blur', handleBlur);
     window.addEventListener('focus', handleFocus);
     document.addEventListener('visibilitychange', handleVis);
     return () => {
+      if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
       window.removeEventListener('blur', handleBlur);
       window.removeEventListener('focus', handleFocus);
       document.removeEventListener('visibilitychange', handleVis);
@@ -302,19 +372,30 @@ export default function AlphaPage() {
     document.title = coverMode ? 'Meeting Notes' : 'Alpha';
   }, [coverMode]);
 
-  // ── Merged status ──
+  // ── Derived state ────────────────────────────────────────────────────────
   const mergedStatus = alphaState.isStreaming ? 'streaming' : status;
+  const isActivelyStreaming = mergedStatus === 'thinking' || mergedStatus === 'streaming';
+  const latestQuestion = activeQuestion
+    || (transcripts.length > 0 ? transcripts[transcripts.length - 1].text : null);
 
-  // ── Cover mode ──
+  // Real-time phase from transcript (no 60s wait)
+  const realtimePhase = detectPhaseFromTranscript(transcripts);
+
+  // Force-agent indicator
+  const forceAgentLabel: Record<NonNullable<ForceAgent>, string> = {
+    terminal: 'T TERMINAL',
+    rescue: 'R RESCUE',
+    negotiation: 'N NEGOTIATE',
+    behavioral: 'B BEHAVIORAL',
+  };
+
   if (coverMode) return <CoverPage />;
 
-  const isActivelyStreaming = mergedStatus === 'thinking' || mergedStatus === 'streaming';
-  const latestQuestion =
-    activeQuestion ||
-    (transcripts.length > 0 ? transcripts[transcripts.length - 1].text : null);
-
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col">
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-sans">
+      {/* Overlays */}
+      {showHotkeys && <HotkeyOverlay onClose={() => setShowHotkeys(false)} />}
+
       <RamblingBanner speakingStartRef={speakingStartRef} />
 
       <StatusBar
@@ -324,6 +405,8 @@ export default function AlphaPage() {
         profilerState={profilerState}
         copilotLatency={alphaState.latency.totalMs ?? 0}
         turnCount={metrics.turnCount}
+        currentAgent={alphaState.agent || undefined}
+        sessionStartTime={sessionStartTime}
       />
 
       <ControlBar
@@ -338,8 +421,25 @@ export default function AlphaPage() {
         onResume={resume}
         onRescue={emergencyRescue}
         onGenerateFollowUp={generateFollowUp}
-        onToggleModes={() => setModesOpen((prev) => !prev)}
+        onToggleModes={() => setModesOpen(m => !m)}
       />
+
+      {/* Force-agent indicator */}
+      {forceAgent && (
+        <div className="px-4 py-1.5 bg-yellow-950/60 border-b border-yellow-800 text-xs text-yellow-400 font-mono flex items-center gap-2">
+          <span className="animate-pulse">⚡</span>
+          <span>Force mode: {forceAgentLabel[forceAgent]}</span>
+          <button onClick={() => setForceAgent(null)} className="ml-auto text-yellow-700 hover:text-yellow-500">✕ clear</button>
+        </div>
+      )}
+
+      {/* Real-time phase detection banner */}
+      {realtimePhase && realtimePhase !== (profilerState?.conversation_phase ?? '') && (
+        <div className="px-4 py-1 bg-zinc-900/80 border-b border-zinc-800 text-xs text-zinc-500 flex items-center gap-2">
+          <span className="text-zinc-700">Phase detected:</span>
+          <span className="text-cyan-600 font-mono">{realtimePhase.replace(/_/g, ' ')}</span>
+        </div>
+      )}
 
       <CapabilityPanel
         capabilities={capabilities}
@@ -348,8 +448,18 @@ export default function AlphaPage() {
         isStreaming={isStreaming}
       />
 
+      {/* Profiler panel */}
+      {showProfiler && (
+        <ProfilerPanel
+          profilerState={profilerState}
+          transcripts={transcripts}
+          sessionDurationSec={metrics.sessionDuration}
+          onExport={exportProfiler}
+        />
+      )}
+
       {error && (
-        <div className="mx-4 mt-3 px-4 py-3 bg-red-950/40 border border-red-800 rounded-lg text-sm text-red-300">
+        <div className="mx-4 mt-3 px-4 py-3 bg-red-950/40 border border-red-800 rounded-xl text-sm text-red-300">
           ⚠ {error}
         </div>
       )}
@@ -365,37 +475,47 @@ export default function AlphaPage() {
       </div>
 
       {/* Scrollable conversation thread */}
-      <div
-        ref={threadRef}
-        className="flex-1 overflow-y-auto px-4 py-4 space-y-3"
-      >
+      <div ref={threadRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
         {bulletHistory.length === 0 && !isActivelyStreaming && !partialText && (
-          <div className="text-center text-zinc-600 text-sm py-12 space-y-2">
-            <p>{isStreaming ? 'Listening... speak or play audio.' : 'Click START, then speak or play audio.'}</p>
-            <p className="text-zinc-700 text-xs">HUD will appear as the interview progresses.</p>
+          <div className="text-center text-zinc-700 text-sm py-16 space-y-2">
+            <p className="text-zinc-500">
+              {isStreaming ? 'Listening — speak or play audio.' : 'Click START, then speak or play audio.'}
+            </p>
+            <p className="text-xs">
+              {isStreaming ? 'HUD appears after each turn.' : 'Press ? for keyboard shortcuts.'}
+            </p>
           </div>
         )}
 
-        {/* FROZEN during streams — React.memo prevents re-renders */}
-        <HistoricalThread bulletHistory={bulletHistory} />
+        {showHUD && <HistoricalThread bulletHistory={bulletHistory} />}
 
-        {/* HOT — re-renders freely during streaming */}
-        <ActiveTurn
-          question={latestQuestion ?? null}
-          rawResponse={alphaState.insight}
-          partialText={partialText}
-          isActive={isActivelyStreaming}
-        />
+        {showHUD && (
+          <ActiveTurn
+            question={latestQuestion ?? null}
+            rawResponse={alphaState.insight}
+            partialText={partialText}
+            isActive={isActivelyStreaming}
+            meta={{
+              agent: alphaState.agent || 'tactical',
+              urgency: alphaState.urgency,
+              firstTokenMs: alphaState.latency.firstTokenMs,
+              truncated: alphaState.truncated,
+              isStreaming: alphaState.isStreaming,
+            }}
+          />
+        )}
+
+        {!showHUD && isActivelyStreaming && (
+          <div className="text-center text-zinc-700 text-xs py-4">HUD hidden — press H to show</div>
+        )}
       </div>
 
       {/* Latency debug strip */}
       {(alphaState.latency.routeMs || alphaState.latency.firstTokenMs) && (
-        <div className="px-4 pb-2 text-xs text-zinc-700 font-mono space-x-4">
-          {alphaState.latency.routeMs && <span>route: {alphaState.latency.routeMs}ms</span>}
-          {alphaState.latency.firstTokenMs && (
-            <span>first token: {alphaState.latency.firstTokenMs}ms</span>
-          )}
-          {alphaState.latency.totalMs && <span>total: {alphaState.latency.totalMs}ms</span>}
+        <div className="px-4 pb-1 text-xs text-zinc-800 font-mono flex gap-4">
+          {alphaState.latency.routeMs && <span>route {alphaState.latency.routeMs}ms</span>}
+          {alphaState.latency.firstTokenMs && <span>first-token {alphaState.latency.firstTokenMs}ms</span>}
+          {alphaState.latency.totalMs && <span>total {alphaState.latency.totalMs}ms</span>}
         </div>
       )}
 
