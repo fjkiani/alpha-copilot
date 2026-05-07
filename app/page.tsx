@@ -14,6 +14,15 @@
  *   ESC       → Toggle cover mode
  *   Ctrl+Shift+S → Toggle auto-stealth
  *   Backspace/Delete → Burn active context
+ *
+ * Bug fixes vs v1:
+ *   BUG-A: onFire no longer reads alphaState.insight (stale closure).
+ *          useAlpha.process() now returns the completed insight string directly.
+ *          bulletHistory is built from the return value, not from state.
+ *   BUG-B: copilotFiringRef.current = true set SYNCHRONOUSLY at top of onFire,
+ *          not via useEffect (which runs one render late).
+ *   BUG-C: alphaState.insight removed from onFire deps — no more spurious
+ *          flush recreation on every stream completion.
  */
 'use client';
 
@@ -57,24 +66,25 @@ export default function AlphaPage() {
   // ── Alpha LLM hook (OpenRouter) ──
   const { state: alphaState, process, dismiss, reset: resetAlpha } = useAlpha(mode);
 
-  // Expose refs/callbacks that useTranscription needs to integrate with useAlpha
+  // ── BUG-B FIX: copilotFiringRef set synchronously in onFire, not via useEffect ──
+  // useEffect runs after render — too late to block the debounce gate from double-firing.
+  // We still sync from alphaState.isStreaming for the case where process() is cancelled
+  // externally (dismiss()), but the primary guard is the synchronous set in onFire.
   const copilotFiringRef = useRef(false);
   const lastCopilotOutputRef = useRef('');
 
-  // Keep copilotFiringRef in sync with alphaState.isStreaming
   useEffect(() => {
+    // Sync for external cancellation (dismiss button, pause, etc.)
     copilotFiringRef.current = alphaState.isStreaming;
   }, [alphaState.isStreaming]);
 
-  // Keep lastCopilotOutputRef in sync with alphaState.insight
   useEffect(() => {
     if (!alphaState.isStreaming && alphaState.insight) {
       lastCopilotOutputRef.current = alphaState.insight;
     }
   }, [alphaState.isStreaming, alphaState.insight]);
 
-  // Build bulletHistory from alphaState for HistoricalThread
-  // useAlpha tracks turn history internally; we surface it via a local ref
+  // ── Bullet history — owned here, not in useAlpha ──
   const bulletHistoryRef = useRef<Array<{
     question: string;
     bullets: string[];
@@ -83,35 +93,45 @@ export default function AlphaPage() {
     timestamp: number;
   }>>([]);
   const [bulletHistory, setBulletHistory] = useState(bulletHistoryRef.current);
-  const activeQuestionRef = useRef('');
+
+  // Active question for display during streaming
   const [activeQuestion, setActiveQuestion] = useState('');
 
-  // onFire: called by debounce gate when a turn is ready
+  // ── BUG-A FIX: onFire reads insight from process() return value, not alphaState ──
+  // BUG-C FIX: alphaState.insight removed from deps — no stale closure, no spurious flush reset
   const onFire = useCallback(
     async (text: string, speaker: SpeakerRole) => {
-      activeQuestionRef.current = text;
+      // BUG-B FIX: set synchronously BEFORE await — blocks gate from double-firing
+      copilotFiringRef.current = true;
+
       setActiveQuestion(text);
       const t0 = Date.now();
-      await process(
+
+      // process() returns the completed insight string (see useAlpha patch below)
+      const completedInsight = await process(
         { text, speaker: speaker === 'candidate' ? 'CANDIDATE' : 'INTERVIEWER', timestamp: t0 },
-        '' // problem context — could wire to a text input if needed
+        ''
       );
-      // After process completes, push to bulletHistory
-      if (alphaState.insight) {
+
+      // BUG-A FIX: use the return value, not alphaState.insight (which is stale here)
+      if (completedInsight) {
         const entry = {
           question: text,
-          bullets: alphaState.insight.split('\n').filter(Boolean),
-          rawResponse: alphaState.insight,
+          bullets: completedInsight.split('\n').filter(Boolean),
+          rawResponse: completedInsight,
           latency: Date.now() - t0,
           timestamp: Date.now(),
         };
         bulletHistoryRef.current = [...bulletHistoryRef.current, entry];
         setBulletHistory([...bulletHistoryRef.current]);
+        lastCopilotOutputRef.current = completedInsight;
       }
-      activeQuestionRef.current = '';
+
       setActiveQuestion('');
+      // copilotFiringRef.current will be set to false by the useEffect above
+      // when alphaState.isStreaming flips to false after process() completes
     },
-    [process, alphaState.insight]
+    [process] // BUG-C FIX: alphaState.insight removed from deps
   );
 
   // ── Transcription hook (AssemblyAI) ──
@@ -131,9 +151,7 @@ export default function AlphaPage() {
     pause,
     resume,
     emergencyRescue,
-    toggleHold,
     flushActiveContext,
-    triggerRescue,
   } = useTranscription(capabilities, sessionContext, onFire, {
     rawResponse: alphaState.insight,
     copilotLatency: alphaState.latency.totalMs ?? 0,
@@ -285,8 +303,7 @@ export default function AlphaPage() {
   }, [coverMode]);
 
   // ── Merged status ──
-  const mergedStatus =
-    alphaState.isStreaming ? 'streaming' : status;
+  const mergedStatus = alphaState.isStreaming ? 'streaming' : status;
 
   // ── Cover mode ──
   if (coverMode) return <CoverPage />;
@@ -359,10 +376,10 @@ export default function AlphaPage() {
           </div>
         )}
 
-        {/* FROZEN during streams */}
+        {/* FROZEN during streams — React.memo prevents re-renders */}
         <HistoricalThread bulletHistory={bulletHistory} />
 
-        {/* HOT — re-renders during streaming */}
+        {/* HOT — re-renders freely during streaming */}
         <ActiveTurn
           question={latestQuestion ?? null}
           rawResponse={alphaState.insight}

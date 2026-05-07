@@ -37,7 +37,7 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
     } catch { return []; }
   })());
 
-  const process = useCallback(async (chunk: TranscriptChunk, problemContext: string) => {
+  const process = useCallback(async (chunk: TranscriptChunk, problemContext: string): Promise<string | null> => {
     const t0 = performance.now();
     // Cap context consistently at 500 chars for both route and stream calls
     const cappedContext = problemContext.slice(0, 500);
@@ -64,7 +64,7 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
     } catch (err) {
       console.error('[useAlpha] Route failed:', err);
       setState(prev => ({ ...prev, error: 'Router unavailable. Check API key.' }));
-      return;
+      return null;
     }
 
     const routeMs = Math.round(performance.now() - t0);
@@ -72,7 +72,7 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
     // Skip chitchat and low-confidence classifications
     if (route.intent === 'chitchat' || route.confidence < 0.6) {
       console.log('[useAlpha] Skipping:', route.intent, 'confidence:', route.confidence);
-      return;
+      return null;
     }
 
     // ── Step 2: Abort any in-flight stream ─────────────────────────────────
@@ -104,10 +104,10 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
         }),
       });
     } catch (err: unknown) {
-      if ((err as Error).name === 'AbortError') return; // user dismissed
+      if ((err as Error).name === 'AbortError') return null; // user dismissed
       console.error('[useAlpha] Stream fetch failed:', err);
       setState(prev => ({ ...prev, isStreaming: false, error: 'Stream request failed' }));
-      return;
+      return null;
     }
 
     // Handle 429 (rate limit on free model) — retry with paid fallback
@@ -128,13 +128,13 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
         });
       } catch {
         setState(prev => ({ ...prev, isStreaming: false, error: 'Rate limited. Try again.' }));
-        return;
+        return null;
       }
     }
 
     if (!streamRes.ok) {
       setState(prev => ({ ...prev, isStreaming: false, error: `Stream error: ${streamRes.status}` }));
-      return;
+      return null;
     }
 
     // ── Step 4: Read SSE stream ────────────────────────────────────────────
@@ -195,14 +195,14 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
             try {
               sessionStorage.setItem(`alpha_history_${mode}`, JSON.stringify(turnHistoryRef.current));
             } catch { /* storage full or unavailable */ }
-            return;
+            return fullInsight;
           } else if (event.type === 'error') {
             setState(prev => ({
               ...prev,
               isStreaming: false,
               error: event.message ?? 'Stream error',
             }));
-            return;
+            return null;
           }
         }
       }
@@ -214,6 +214,7 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
     } finally {
       reader.cancel();
     }
+    return null;
   }, [mode]);
 
   const dismiss = useCallback(() => {
