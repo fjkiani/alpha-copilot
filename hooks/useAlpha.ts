@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useCallback, useRef } from 'react';
-import { TranscriptChunk } from './useTranscript';
+import { TranscriptChunk } from '@/lib/types';
 
 export type AlphaState = {
   insight: string;

@@ -1,181 +1,390 @@
+/**
+ * Alpha Copilot — Unified Orchestrator
+ *
+ * Single app. AssemblyAI STT → OpenRouter LLM → HUD.
+ *
+ * Architecture:
+ *   useTranscription (AssemblyAI WS + audio pipeline + profiler)
+ *     └─ onFire → useAlpha.process (OpenRouter route → stream)
+ *   useAlpha owns: rawResponse, bulletHistory, copilotLatency, activeQuestion
+ *   useTranscription owns: transcripts, partialText, status, profilerState
+ *
+ * Keyboard shortcuts:
+ *   SPACE     → SOS Rescue (handled in useTranscription)
+ *   ESC       → Toggle cover mode
+ *   Ctrl+Shift+S → Toggle auto-stealth
+ *   Backspace/Delete → Burn active context
+ */
 'use client';
 
-import { useState, useCallback, useRef, useEffect } from 'react';
-import { BrowserCheck } from '@/components/BrowserCheck';
-import { ModeSelector } from '@/components/ModeSelector';
-import { InsightCard } from '@/components/InsightCard';
-import { useTranscript, TranscriptChunk } from '@/hooks/useTranscript';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAlpha } from '@/hooks/useAlpha';
+import { useTranscription } from '@/hooks/useTranscription';
+import type { SpeakerRole } from '@/hooks/useTranscriptProcessor';
+
+import CoverPage from '@/components/CoverPage';
+import RamblingBanner from '@/components/RamblingBanner';
+import StatusBar from '@/components/StatusBar';
+import ControlBar from '@/components/ControlBar';
+import CapabilityPanel, { type Capabilities } from '@/components/CapabilityPanel';
+import SessionSetup, { type SessionContext } from '@/components/SessionSetup';
+import HistoricalThread from '@/components/HistoricalThread';
+import ActiveTurn from '@/components/ActiveTurn';
+import FollowUpPanel from '@/components/FollowUpPanel';
+import { ModeSelector } from '@/components/ModeSelector';
 
 type Mode = 'interview' | 'sales' | 'demo';
 
-export default function Home() {
+export default function AlphaPage() {
+  // ── Mode & capabilities ──
   const [mode, setMode] = useState<Mode>('interview');
-  const [problemContext, setProblemContext] = useState('');
-  const [chunks, setChunks] = useState<TranscriptChunk[]>([]);
-  const [myVoice, setMyVoice] = useState(false); // false = capturing interviewer, true = capturing own mic
-  const processingRef = useRef(false);
+  const [capabilities, setCapabilities] = useState<Capabilities>({
+    terminalMode: false,
+    clipboardCapture: true,
+    autoStealth: true,
+    keyterms: true,
+    profiler: true,
+    autoCopilot: true,
+  });
+  const [modesOpen, setModesOpen] = useState(false);
+  const [sessionContext, setSessionContext] = useState<SessionContext | null>(null);
+  const [coverMode, setCoverMode] = useState(false);
 
-  const { state, process, dismiss, reset } = useAlpha(mode);
+  const toggleCapability = useCallback((key: keyof Capabilities) => {
+    setCapabilities((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
 
-  const handleChunk = useCallback(async (chunk: TranscriptChunk) => {
-    setChunks(prev => [...prev.slice(-9), chunk]);
+  // ── Alpha LLM hook (OpenRouter) ──
+  const { state: alphaState, process, dismiss, reset: resetAlpha } = useAlpha(mode);
 
-    // Prevent concurrent processing — one inference at a time
-    if (processingRef.current) return;
-    processingRef.current = true;
-    try {
-      await process(chunk, problemContext);
-    } finally {
-      processingRef.current = false;
+  // Expose refs/callbacks that useTranscription needs to integrate with useAlpha
+  const copilotFiringRef = useRef(false);
+  const lastCopilotOutputRef = useRef('');
+
+  // Keep copilotFiringRef in sync with alphaState.isStreaming
+  useEffect(() => {
+    copilotFiringRef.current = alphaState.isStreaming;
+  }, [alphaState.isStreaming]);
+
+  // Keep lastCopilotOutputRef in sync with alphaState.insight
+  useEffect(() => {
+    if (!alphaState.isStreaming && alphaState.insight) {
+      lastCopilotOutputRef.current = alphaState.insight;
     }
-  }, [process, problemContext]);
+  }, [alphaState.isStreaming, alphaState.insight]);
 
-  const { isListening, error: transcriptError, start, stop } = useTranscript(
-    handleChunk,
-    myVoice ? 'CANDIDATE' : 'INTERVIEWER'
+  // Build bulletHistory from alphaState for HistoricalThread
+  // useAlpha tracks turn history internally; we surface it via a local ref
+  const bulletHistoryRef = useRef<Array<{
+    question: string;
+    bullets: string[];
+    rawResponse: string;
+    latency: number;
+    timestamp: number;
+  }>>([]);
+  const [bulletHistory, setBulletHistory] = useState(bulletHistoryRef.current);
+  const activeQuestionRef = useRef('');
+  const [activeQuestion, setActiveQuestion] = useState('');
+
+  // onFire: called by debounce gate when a turn is ready
+  const onFire = useCallback(
+    async (text: string, speaker: SpeakerRole) => {
+      activeQuestionRef.current = text;
+      setActiveQuestion(text);
+      const t0 = Date.now();
+      await process(
+        { text, speaker: speaker === 'candidate' ? 'CANDIDATE' : 'INTERVIEWER', timestamp: t0 },
+        '' // problem context — could wire to a text input if needed
+      );
+      // After process completes, push to bulletHistory
+      if (alphaState.insight) {
+        const entry = {
+          question: text,
+          bullets: alphaState.insight.split('\n').filter(Boolean),
+          rawResponse: alphaState.insight,
+          latency: Date.now() - t0,
+          timestamp: Date.now(),
+        };
+        bulletHistoryRef.current = [...bulletHistoryRef.current, entry];
+        setBulletHistory([...bulletHistoryRef.current]);
+      }
+      activeQuestionRef.current = '';
+      setActiveQuestion('');
+    },
+    [process, alphaState.insight]
   );
 
-  // Keyboard shortcuts: Space = toggle listen, Esc = dismiss insight
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      // Don't fire when typing in the context input
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (e.code === 'Space') {
-        e.preventDefault();
-        isListening ? stop() : start();
+  // ── Transcription hook (AssemblyAI) ──
+  const {
+    isStreaming,
+    transcripts,
+    partialText,
+    metrics,
+    status,
+    error,
+    held,
+    isPaused,
+    speakingStartRef,
+    profilerState,
+    start,
+    stop,
+    pause,
+    resume,
+    emergencyRescue,
+    toggleHold,
+    flushActiveContext,
+    triggerRescue,
+  } = useTranscription(capabilities, sessionContext, onFire, {
+    rawResponse: alphaState.insight,
+    copilotLatency: alphaState.latency.totalMs ?? 0,
+    bulletHistory,
+    activeQuestion,
+    copilotFiringRef,
+    lastCopilotOutputRef,
+    cancelInFlight: dismiss,
+    flushHistory: () => {
+      if (bulletHistoryRef.current.length > 0) {
+        bulletHistoryRef.current = bulletHistoryRef.current.slice(0, -1);
+        setBulletHistory([...bulletHistoryRef.current]);
       }
-      if (e.code === 'Escape') {
-        dismiss();
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [isListening, start, stop, dismiss]);
+    },
+  });
 
-  const handleModeChange = (m: Mode) => {
-    if (isListening) stop();
-    reset();
-    setChunks([]);
-    setMode(m);
-  };
+  // ── Follow-up generator ──
+  const [followUp, setFollowUp] = useState('');
+  const [followUpLoading, setFollowUpLoading] = useState(false);
+
+  const generateFollowUp = useCallback(async () => {
+    setFollowUpLoading(true);
+    setFollowUp('');
+    try {
+      const res = await fetch('/api/followup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ history: bulletHistory, profilerState }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let fullText = '';
+      let buffer = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const jsonStr = trimmed.slice(5).trim();
+          if (!jsonStr) continue;
+          try {
+            const event = JSON.parse(jsonStr) as { done?: boolean; token?: string; error?: string };
+            if (event.done) break;
+            if (event.error) throw new Error(event.error);
+            if (event.token) { fullText += event.token; setFollowUp(fullText); }
+          } catch { /* skip malformed */ }
+        }
+      }
+    } catch (e) {
+      setFollowUp(`⚠ Error: ${(e as Error).message}`);
+    } finally {
+      setFollowUpLoading(false);
+    }
+  }, [bulletHistory, profilerState]);
+
+  const copyFollowUp = useCallback(() => {
+    navigator.clipboard.writeText(followUp).catch(() => {
+      const ta = document.createElement('textarea');
+      ta.value = followUp;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    });
+  }, [followUp]);
+
+  // ── Mode change ──
+  const handleModeChange = useCallback(
+    (m: Mode) => {
+      if (isStreaming) stop();
+      resetAlpha();
+      bulletHistoryRef.current = [];
+      setBulletHistory([]);
+      setMode(m);
+    },
+    [isStreaming, stop, resetAlpha]
+  );
+
+  // ── Auto-scroll ──
+  const threadRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
+
+  useEffect(() => {
+    const node = threadRef.current;
+    if (!node) return;
+    const onScroll = () => {
+      const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+      shouldAutoScrollRef.current = distanceFromBottom < 80;
+    };
+    node.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+    return () => node.removeEventListener('scroll', onScroll);
+  }, []);
+
+  useEffect(() => {
+    if (!threadRef.current) return;
+    if (shouldAutoScrollRef.current) {
+      threadRef.current.scrollTop = threadRef.current.scrollHeight;
+    }
+  }, [bulletHistory, alphaState.insight, partialText]);
+
+  // ── Keyboard shortcuts ──
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setCoverMode((m) => !m);
+      if (e.ctrlKey && e.shiftKey && e.code === 'KeyS') {
+        e.preventDefault();
+        toggleCapability('autoStealth');
+      }
+      if (
+        (e.code === 'Backspace' || e.code === 'Delete') &&
+        e.target === document.body
+      ) {
+        e.preventDefault();
+        flushActiveContext();
+      }
+    },
+    [toggleCapability, flushActiveContext]
+  );
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleKeyDown]);
+
+  // ── Auto-stealth ──
+  useEffect(() => {
+    if (!capabilities.autoStealth) return;
+    const handleBlur = () => setCoverMode(true);
+    const handleFocus = () => setCoverMode(false);
+    const handleVis = () => setCoverMode(document.hidden);
+    window.addEventListener('blur', handleBlur);
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVis);
+    return () => {
+      window.removeEventListener('blur', handleBlur);
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVis);
+    };
+  }, [capabilities.autoStealth]);
+
+  useEffect(() => {
+    document.title = coverMode ? 'Meeting Notes' : 'Alpha';
+  }, [coverMode]);
+
+  // ── Merged status ──
+  const mergedStatus =
+    alphaState.isStreaming ? 'streaming' : status;
+
+  // ── Cover mode ──
+  if (coverMode) return <CoverPage />;
+
+  const isActivelyStreaming = mergedStatus === 'thinking' || mergedStatus === 'streaming';
+  const latestQuestion =
+    activeQuestion ||
+    (transcripts.length > 0 ? transcripts[transcripts.length - 1].text : null);
 
   return (
-    <BrowserCheck>
-      <main className="min-h-screen bg-zinc-950 text-zinc-100 p-8">
-        <div className="max-w-2xl mx-auto space-y-6">
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col">
+      <RamblingBanner speakingStartRef={speakingStartRef} />
 
-          {/* Header */}
-          <div className="flex items-center justify-between">
-            <h1 className="text-2xl font-bold tracking-tight">Alpha</h1>
-            <a
-              href="/api/health"
-              target="_blank"
-              className="text-xs text-zinc-600 hover:text-zinc-400"
-            >
-              health check
-            </a>
-          </div>
+      <StatusBar
+        status={mergedStatus}
+        isStreaming={isStreaming}
+        held={held}
+        profilerState={profilerState}
+        copilotLatency={alphaState.latency.totalMs ?? 0}
+        turnCount={metrics.turnCount}
+      />
 
-          {/* Mode selector — disabled while listening */}
-          <ModeSelector mode={mode} onChange={handleModeChange} disabled={isListening} />
+      <ControlBar
+        isStreaming={isStreaming}
+        isPaused={isPaused}
+        hasHistory={bulletHistory.length > 0}
+        followUpLoading={followUpLoading}
+        modesOpen={modesOpen}
+        onStart={start}
+        onStop={stop}
+        onPause={pause}
+        onResume={resume}
+        onRescue={emergencyRescue}
+        onGenerateFollowUp={generateFollowUp}
+        onToggleModes={() => setModesOpen((prev) => !prev)}
+      />
 
-          {/* Problem context */}
-          <input
-            type="text"
-            placeholder="Active problem / topic (e.g. 'Design a URL shortener')"
-            value={problemContext}
-            onChange={e => setProblemContext(e.target.value)}
-            disabled={isListening}
-            className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-3 text-sm
-              outline-none focus:border-zinc-500 disabled:opacity-50 transition-colors"
-          />
+      <CapabilityPanel
+        capabilities={capabilities}
+        onToggle={toggleCapability}
+        isOpen={modesOpen}
+        isStreaming={isStreaming}
+      />
 
-          {/* Speaker source toggle */}
-          <div className="flex items-center gap-3 text-sm">
-            <span className="text-zinc-500 text-xs">Capturing:</span>
-            <button
-              onClick={() => setMyVoice(false)}
-              disabled={isListening}
-              className={`px-3 py-1 rounded text-xs transition-colors disabled:opacity-50
-                ${!myVoice ? 'bg-zinc-100 text-zinc-900 font-medium' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}
-            >
-              Their voice (tab audio)
-            </button>
-            <button
-              onClick={() => setMyVoice(true)}
-              disabled={isListening}
-              className={`px-3 py-1 rounded text-xs transition-colors disabled:opacity-50
-                ${myVoice ? 'bg-zinc-100 text-zinc-900 font-medium' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}
-            >
-              My voice (mic)
-            </button>
-          </div>
-
-          {/* Controls */}
-          <div className="flex gap-3 items-center">
-            <button
-              onClick={isListening ? stop : start}
-              className={`px-6 py-3 rounded-lg font-medium transition-colors
-                ${isListening
-                  ? 'bg-red-600 hover:bg-red-700 text-white'
-                  : 'bg-green-600 hover:bg-green-700 text-white'
-                }`}
-            >
-              {isListening ? 'Stop' : 'Start Listening'}
-            </button>
-
-            {isListening && (
-              <span className="flex items-center gap-2 text-sm text-zinc-400">
-                <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-                Listening
-              </span>
-            )}
-
-            <span className="text-xs text-zinc-700 ml-auto">
-              Space = toggle · Esc = dismiss
-            </span>
-          </div>
-
-          {/* Transcript error */}
-          {transcriptError && (
-            <div className="text-sm text-red-400 bg-red-950/30 border border-red-900 rounded-lg px-4 py-3">
-              {transcriptError === 'PERMISSION_DENIED' && 'Microphone permission denied. Allow microphone access and refresh.'}
-              {transcriptError === 'NO_SPEECH' && 'No speech detected. Check your microphone.'}
-              {transcriptError === 'NETWORK' && 'Network error in speech recognition. Check your connection.'}
-              {transcriptError === 'NOT_SUPPORTED' && 'Speech recognition not supported. Use Chrome or Edge.'}
-            </div>
-          )}
-
-          {/* Live transcript */}
-          <div className="bg-zinc-900 rounded-lg p-4 h-48 overflow-y-auto space-y-2">
-            {chunks.length === 0 ? (
-              <p className="text-zinc-600 text-sm">
-                {isListening ? 'Listening... speak now.' : 'Transcript will appear here.'}
-              </p>
-            ) : (
-              chunks.slice(-5).map((c, i) => (
-                <div key={i} className="text-sm">
-                  <span className="text-zinc-500 text-xs mr-2">{c.speaker}</span>
-                  <span className="text-zinc-300">{c.text}</span>
-                </div>
-              ))
-            )}
-          </div>
-
-          {/* Latency debug panel */}
-          {(state.latency.routeMs || state.latency.firstTokenMs || state.latency.totalMs) && (
-            <div className="text-xs text-zinc-600 font-mono space-x-4">
-              {state.latency.routeMs && <span>route: {state.latency.routeMs}ms</span>}
-              {state.latency.firstTokenMs && <span>first token: {state.latency.firstTokenMs}ms</span>}
-              {state.latency.totalMs && <span>total: {state.latency.totalMs}ms</span>}
-            </div>
-          )}
+      {error && (
+        <div className="mx-4 mt-3 px-4 py-3 bg-red-950/40 border border-red-800 rounded-lg text-sm text-red-300">
+          ⚠ {error}
         </div>
+      )}
 
-        {/* Floating insight overlay */}
-        <InsightCard state={state} onDismiss={dismiss} />
-      </main>
-    </BrowserCheck>
+      {/* Mode selector + session setup */}
+      <div className="px-4 pt-4 space-y-3">
+        <ModeSelector mode={mode} onChange={handleModeChange} disabled={isStreaming} />
+        <SessionSetup
+          onContextReady={setSessionContext}
+          isStreaming={isStreaming}
+          sessionContext={sessionContext}
+        />
+      </div>
+
+      {/* Scrollable conversation thread */}
+      <div
+        ref={threadRef}
+        className="flex-1 overflow-y-auto px-4 py-4 space-y-3"
+      >
+        {bulletHistory.length === 0 && !isActivelyStreaming && !partialText && (
+          <div className="text-center text-zinc-600 text-sm py-12 space-y-2">
+            <p>{isStreaming ? 'Listening... speak or play audio.' : 'Click START, then speak or play audio.'}</p>
+            <p className="text-zinc-700 text-xs">HUD will appear as the interview progresses.</p>
+          </div>
+        )}
+
+        {/* FROZEN during streams */}
+        <HistoricalThread bulletHistory={bulletHistory} />
+
+        {/* HOT — re-renders during streaming */}
+        <ActiveTurn
+          question={latestQuestion ?? null}
+          rawResponse={alphaState.insight}
+          partialText={partialText}
+          isActive={isActivelyStreaming}
+        />
+      </div>
+
+      {/* Latency debug strip */}
+      {(alphaState.latency.routeMs || alphaState.latency.firstTokenMs) && (
+        <div className="px-4 pb-2 text-xs text-zinc-700 font-mono space-x-4">
+          {alphaState.latency.routeMs && <span>route: {alphaState.latency.routeMs}ms</span>}
+          {alphaState.latency.firstTokenMs && (
+            <span>first token: {alphaState.latency.firstTokenMs}ms</span>
+          )}
+          {alphaState.latency.totalMs && <span>total: {alphaState.latency.totalMs}ms</span>}
+        </div>
+      )}
+
+      <div className="px-4 pb-4">
+        <FollowUpPanel followUp={followUp} onCopy={copyFollowUp} />
+      </div>
+    </div>
   );
 }
