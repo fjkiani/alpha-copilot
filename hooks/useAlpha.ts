@@ -8,6 +8,12 @@
  * - Route timeout fallback is handled server-side — client just gets tactical
  * - Retry on truncated response (once, same payload)
  * - process() returns Promise<string | null> for BUG-A fix
+ *
+ * BUG-3B FIX (2026-05-09):
+ *   - problem_context (conversation_context from page.tsx) is now forwarded
+ *     to /api/stream as both problem_context AND conversation_context fields.
+ *     This gives the LLM the last 10 tagged transcript lines as raw context.
+ *   - cappedContext limit raised 500 → 2000 chars to accommodate 10 transcript lines.
  */
 'use client';
 
@@ -61,7 +67,8 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
     }
   ): Promise<string | null> => {
     const t0 = performance.now();
-    const cappedContext = problemContext.slice(0, 500);
+    // BUG-3B FIX: raised from 500 → 2000 to accommodate 10 transcript lines
+    const cappedContext = problemContext.slice(0, 2000);
     const { profilerState = null, isRambling = false, retryCount = 0 } = opts ?? {};
 
     // ── Step 1: Route ──────────────────────────────────────────────────────
@@ -129,6 +136,9 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
           transcript: chunk.text,
           mode,
           problem_context: cappedContext,
+          // BUG-3B FIX: also send as conversation_context so stream route
+          // can inject it as [CONVERSATION HISTORY] block in the user message
+          conversation_context: cappedContext,
           turn_history: turnHistoryRef.current,
           profiler_state: profilerState,
           speaker: chunk.speaker.toLowerCase(),
@@ -221,9 +231,9 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
               return process(chunk, problemContext, { profilerState, isRambling, retryCount: retryCount + 1 });
             }
 
-            // Persist turn history
+            // Persist turn history (last 8 pairs = 16 messages, matching stream route window)
             turnHistoryRef.current = [
-              ...turnHistoryRef.current.slice(-8),
+              ...turnHistoryRef.current.slice(-14),
               { role: 'user', content: chunk.text },
               { role: 'assistant', content: fullInsight },
             ];

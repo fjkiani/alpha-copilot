@@ -6,9 +6,18 @@
  *   2A. Standard Tactical (interviewer asking)
  *   2B. Candidate Support (Alpha is speaking)
  *   2C. Course Correct (Alpha is rambling/off-script)
- *   2D. Rescue Mode (brain freeze / SOS)
+ *   2D. Rescue Mode (brain freeze / SOS — short, mouth autocomplete)
+ *   2E. Deep Rescue (manual RESCUE button — full A-Z support with conversation context)
  *   3. Terminal Mode (coding phase)
  *   4. Post-Session Follow-Up
+ *
+ * BUG-4 FIX (2026-05-09):
+ *   - Added buildDeepRescuePrompt() for manual RESCUE button.
+ *     Deep rescue receives the last 10 transcript lines and outputs a full
+ *     structured response: diagnosis, exact words to say, code if needed,
+ *     and a pivot to regain control. This is A-Z support, not mouth autocomplete.
+ *   - buildTacticalPrompt() now detects [DEEP_RESCUE] prefix in transcript
+ *     and routes to buildDeepRescuePrompt() instead of buildRescuePrompt().
  */
 
 export interface KnowledgeBase {
@@ -262,7 +271,9 @@ RULES:
 }
 
 // ─────────────────────────────────────────────────────
-// AGENT 2D: RESCUE MODE (Brain Freeze / SOS)
+// AGENT 2D: RESCUE MODE (Auto brain-freeze — SHORT)
+// Fires automatically after 5s of candidate silence.
+// Output: 5-10 words to finish the current sentence. Mouth autocomplete only.
 // ─────────────────────────────────────────────────────
 export function buildRescuePrompt(kb: KnowledgeBase): string {
   return `You are Zeta-Core in RESCUE MODE.
@@ -287,19 +298,71 @@ RULES:
 }
 
 // ─────────────────────────────────────────────────────
+// AGENT 2E: DEEP RESCUE (Manual RESCUE button — A-Z support)
+// Fires when user presses the RESCUE button or SPACE hotkey.
+// Receives the last 10 transcript lines as full conversation context.
+// Output: full structured response — diagnosis, exact words, code if needed, pivot.
+// ─────────────────────────────────────────────────────
+export function buildDeepRescuePrompt(kb: KnowledgeBase, profilerState: ProfilerState | null): string {
+  const context = buildContextBlock(kb, profilerState);
+
+  return `You are Zeta-Core in DEEP RESCUE MODE.
+Alpha has manually triggered emergency support. They need full A-Z help RIGHT NOW.
+You have the last 10 lines of conversation. Analyze the full context and provide complete support.
+
+${context}
+
+MISSION: Read the conversation history. Understand exactly where Alpha is stuck.
+Then provide everything they need to recover and dominate the next 2 minutes.
+
+OUTPUT FORMAT:
+<THINK>
+(Analyze: What was the question? What did Alpha say? Where did they get stuck? What's the complete answer?)
+</THINK>
+
+[RESCUE]
+(The exact 1-2 sentences Alpha should say RIGHT NOW to recover. Natural, confident, no filler.)
+
+[THE FULL ANSWER]
+- (Core mechanism — the HOW, not the WHAT)
+- (Implementation detail — specific, architectural, senior-level)
+- (Production tradeoff or real-world example from Alpha's background)
+
+[THE CODE]
+(ONLY if the question involves code. One clean, complete implementation. Skip this section if not applicable.)
+
+[THE PIVOT]
+(One sentence to hand control back: a question or observation that makes Alpha look sharp.)
+
+HARD RULES:
+- [RESCUE] must be words Alpha can read aloud immediately. No brackets, no labels.
+- [THE FULL ANSWER] must explain mechanisms, not buzzwords.
+- If you write code, make it complete and runnable — no "..." placeholders.
+- NEVER fabricate projects or metrics not in Alpha's background.
+- This is triage. Be direct. No preamble.`;
+}
+
+// ─────────────────────────────────────────────────────
 // MASTER ROUTER
 // ─────────────────────────────────────────────────────
 export interface ClientTelemetry {
   isRambling?: boolean;
   isRescue?: boolean;
+  isDeepRescue?: boolean;
 }
 
 export function buildTacticalPrompt(
   kb: KnowledgeBase,
   profilerState: ProfilerState | null,
   clientTelemetry: ClientTelemetry,
-  speaker: string = 'interviewer'
+  speaker: string = 'interviewer',
+  transcript?: string
 ): string {
+  // Deep rescue: manual RESCUE button — full A-Z support
+  if (clientTelemetry?.isDeepRescue || transcript?.startsWith('[DEEP_RESCUE]')) {
+    return buildDeepRescuePrompt(kb, profilerState);
+  }
+  // Short rescue: auto brain-freeze — mouth autocomplete
   if (clientTelemetry?.isRescue) return buildRescuePrompt(kb);
   if (clientTelemetry?.isRambling) return buildCourseCorrectPrompt(kb, profilerState);
   if (speaker === 'candidate') return buildCandidateSupportPrompt(kb, profilerState);

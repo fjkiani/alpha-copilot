@@ -14,6 +14,16 @@
  *
  * This file owns: start/stop/pause/resume lifecycle, capabilities ref,
  *   clipboard poller, brain freeze detection, SOS hotkey.
+ *
+ * BUG-2 FIX (2026-05-09):
+ *   - emergencyRescue() NO LONGER calls stopInternal(). The WebSocket stays
+ *     alive. It only cancels the in-flight LLM request and fires onFire()
+ *     with the deep rescue context. The session continues uninterrupted.
+ *   - triggerRescue() (auto brain-freeze) fires a SHORT rescue (mouth
+ *     autocomplete). emergencyRescue() (manual RESCUE button) fires a DEEP
+ *     rescue with the last 10 transcript lines for full A-Z support.
+ *   - Deep rescue passes isDeepRescue=true in the onFire call so the router
+ *     can select the deep rescue agent.
  */
 'use client';
 
@@ -62,7 +72,7 @@ export interface TranscriptionHook {
   stop: () => void;
   pause: () => void;
   resume: () => Promise<void>;
-  emergencyRescue: () => Promise<void>;
+  emergencyRescue: () => void;
   toggleHold: () => void;
   flushActiveContext: () => void;
   triggerRescue: () => void;
@@ -186,7 +196,6 @@ export function useTranscription(
           ((text.includes('\n') && /[{}();=]/.test(text)) ||
             /^(class|def|function|const|let|var|import|export|if|for|while|return)\b/m.test(text));
         if (looksLikeCode) {
-          // Store in a ref accessible to the gate/alpha
           alphaState.lastCopilotOutputRef.current = text; // reuse ref as clipboard bridge
           console.log('[clipboard] Captured code:', text.slice(0, 60) + '...');
         }
@@ -312,32 +321,60 @@ export function useTranscription(
     setHeld(heldRef.current);
   }, []);
 
-  // ── Rescue ──
+  // ── Rescue (auto brain-freeze: SHORT rescue — mouth autocomplete) ──
+  // Fires automatically after 5s of candidate silence.
+  // Sends the last partial sentence to the rescue agent for 5-10 word completion.
   const triggerRescue = useCallback(() => {
     if (!isStreamingRef.current) return;
     if (alphaState.copilotFiringRef.current) return;
     const partialText = gate.previewText || transcript.partialText || '';
     const lastTranscripts = transcript.transcripts.slice(-3).map((t) => t.text).join(' ');
     const rescueContext = partialText || lastTranscripts || 'Alpha is frozen mid-sentence.';
-    console.log('[rescue] 🚨 RESCUE MODE — context:', rescueContext.slice(0, 80));
+    console.log('[rescue] 🚨 AUTO RESCUE (brain-freeze) — context:', rescueContext.slice(0, 80));
     gate.reset();
-    onFire(rescueContext, 'candidate'); // fires with rescue context
+    onFire(rescueContext, 'candidate');
     rescueFiredRef.current = true;
   }, [alphaState.copilotFiringRef, gate, transcript, onFire]);
 
-  const emergencyRescue = useCallback(async () => {
-    const partialText = gate.previewText || transcript.partialText || '';
-    const lastTranscripts = transcript.transcripts.slice(-5).map((t) => t.text).join(' ');
-    const rescueContext = (partialText || lastTranscripts || 'Alpha is frozen mid-sentence.').trim();
+  // ── Emergency Rescue (manual RESCUE button: DEEP rescue — A-Z support) ──
+  // BUG-2 FIX: Does NOT call stopInternal(). WebSocket stays alive.
+  // Cancels in-flight LLM, builds rich context from last 10 transcript lines,
+  // fires onFire() with deep rescue context. Session continues uninterrupted.
+  const emergencyRescue = useCallback(() => {
+    if (!isStreamingRef.current && !alphaState.copilotFiringRef.current) return;
+
+    // Cancel any in-flight LLM request
     alphaState.cancelInFlight();
-    stopInternal();
-    setIsPaused(true);
-    setHeld(true);
-    heldRef.current = true;
-    setStatus('thinking');
-    onFire(rescueContext, 'candidate');
-    setStatus('paused');
-  }, [alphaState, gate, transcript, stopInternal, onFire]);
+
+    // Build rich context: last 10 transcript lines (tagged with speaker)
+    const recentLines = transcript.transcripts
+      .slice(-10)
+      .map((t) => `${t.speaker === 'candidate' ? 'Me' : 'Interviewer'}: ${t.text}`)
+      .join('\n');
+
+    const partialText = gate.previewText || transcript.partialText || '';
+    const rescueContext = [
+      recentLines,
+      partialText ? `[PARTIAL — currently saying]: ${partialText}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n')
+      .trim() || 'Alpha needs full A-Z support — context unavailable.';
+
+    console.log('[rescue] 🆘 DEEP RESCUE (manual) — context lines:', transcript.transcripts.length);
+
+    // Reset gate so the rescue fires immediately without waiting for debounce
+    gate.reset();
+
+    // Fire with 'interviewer' speaker so the tactical agent (not support mode)
+    // handles it — but the deep rescue prompt is selected via isDeepRescue flag
+    // injected by onFire in page.tsx
+    onFire(`[DEEP_RESCUE]\n${rescueContext}`, 'interviewer');
+    rescueFiredRef.current = true;
+
+    // Status stays 'listening' — WebSocket is NOT disconnected
+    setStatus('listening');
+  }, [alphaState, gate, transcript, onFire]);
 
   const flushActiveContext = useCallback(() => {
     alphaState.flushHistory();
@@ -364,7 +401,7 @@ export function useTranscription(
     return () => { if (brainFreezeTimerRef.current) clearInterval(brainFreezeTimerRef.current); };
   }, [isStreaming, transcript, triggerRescue]);
 
-  // ── SOS Hotkey (Spacebar) ──
+  // ── SOS Hotkey (Spacebar) — triggers DEEP rescue ──
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.code !== 'Space') return;
@@ -375,12 +412,12 @@ export function useTranscription(
       ) return;
       if (!isStreamingRef.current) return;
       e.preventDefault();
-      console.log('[rescue] 🆘 SOS HOTKEY');
-      triggerRescue();
+      console.log('[rescue] 🆘 SOS HOTKEY — triggering deep rescue');
+      emergencyRescue();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [triggerRescue]);
+  }, [emergencyRescue]);
 
   return {
     isStreaming,

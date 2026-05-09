@@ -9,6 +9,18 @@
  * - Request deduplication: identical transcript+agent within 500ms is dropped
  * - Timeout guard: 8s hard limit on upstream fetch
  * - Truncation detection: signals client if response was cut off
+ *
+ * BUG-3B FIX (2026-05-09):
+ *   - turn_history window expanded from 6 → 16 messages (last 8 pairs).
+ *     The LLM now sees the full conversation thread, not just the last 3 pairs.
+ *   - conversation_context field added to user message: last 10 tagged transcript
+ *     lines injected directly so the model has raw conversation history even
+ *     before turn_history is populated.
+ *
+ * BUG-4 FIX (2026-05-09):
+ *   - Deep rescue detection: if transcript starts with [DEEP_RESCUE], the
+ *     buildTacticalPrompt() router selects buildDeepRescuePrompt() which
+ *     provides full A-Z support with conversation context.
  */
 import { NextRequest } from 'next/server';
 import { AGENT_CONFIGS, AgentId } from '@/lib/agentConfigs';
@@ -16,6 +28,7 @@ import {
   buildTacticalPrompt,
   buildTerminalModePrompt,
   buildRescuePrompt,
+  buildDeepRescuePrompt,
   buildFollowUpPrompt,
   type KnowledgeBase,
   type ProfilerState,
@@ -50,16 +63,21 @@ function buildSystemPromptForAgent(
   agentId: AgentId,
   profilerState: ProfilerState | null,
   clientTelemetry: ClientTelemetry,
-  speaker: string
+  speaker: string,
+  transcript: string
 ): string {
-  // For agents that have rich KB-aware prompts, use buildSystemPrompt.ts
   switch (agentId) {
     case 'tactical':
     case 'behavioral':
-      return buildTacticalPrompt(kb, profilerState, clientTelemetry, speaker);
+      // Pass transcript so buildTacticalPrompt can detect [DEEP_RESCUE] prefix
+      return buildTacticalPrompt(kb, profilerState, clientTelemetry, speaker, transcript);
     case 'code':
       return buildTerminalModePrompt(kb);
     case 'rescue':
+      // If deep rescue flag set, use deep rescue prompt
+      if (clientTelemetry?.isDeepRescue || transcript?.startsWith('[DEEP_RESCUE]')) {
+        return buildDeepRescuePrompt(kb, profilerState);
+      }
       return buildRescuePrompt(kb);
     default:
       // sales, demo, negotiation — use agentConfigs system string (already good)
@@ -93,6 +111,7 @@ export async function POST(req: NextRequest) {
     mode: string;
     problem_context: string;
     turn_history: Array<{ role: string; content: string }>;
+    conversation_context?: string;   // NEW: last 10 tagged transcript lines
     profiler_state?: ProfilerState | null;
     speaker?: string;
     client_telemetry?: ClientTelemetry;
@@ -110,15 +129,19 @@ export async function POST(req: NextRequest) {
     mode,
     problem_context,
     turn_history,
+    conversation_context = '',
     profiler_state = null,
     speaker = 'interviewer',
     client_telemetry = {},
   } = body;
 
-  // Deduplication
-  const dedupKey = `${agent}:${transcript.slice(0, 80)}`;
-  if (isDuplicate(dedupKey)) {
-    return new Response(null, { status: 204 }); // No Content — silently drop
+  // Deduplication — skip for deep rescue (always unique)
+  const isDeepRescue = transcript?.startsWith('[DEEP_RESCUE]') || client_telemetry?.isDeepRescue;
+  if (!isDeepRescue) {
+    const dedupKey = `${agent}:${transcript.slice(0, 80)}`;
+    if (isDuplicate(dedupKey)) {
+      return new Response(null, { status: 204 }); // No Content — silently drop
+    }
   }
 
   const config = AGENT_CONFIGS[agent];
@@ -126,21 +149,37 @@ export async function POST(req: NextRequest) {
     return new Response(`Unknown agent: ${agent}`, { status: 400 });
   }
 
-  // Build system prompt — KB-aware, profiler-injected
-  const systemPrompt = buildSystemPromptForAgent(agent, profiler_state, client_telemetry, speaker);
+  // Build system prompt — KB-aware, profiler-injected, deep rescue aware
+  const systemPrompt = buildSystemPromptForAgent(
+    agent, profiler_state, client_telemetry, speaker, transcript
+  );
 
   // Build user message with KB context block
   const kbContext = buildKBContext(profiler_state);
+
+  // For deep rescue, strip the [DEEP_RESCUE] prefix from the transcript
+  // so the model sees the clean conversation history
+  const cleanTranscript = isDeepRescue
+    ? transcript.replace(/^\[DEEP_RESCUE\]\n?/, '').trim()
+    : transcript;
+
+  // conversation_context: last 10 tagged transcript lines (raw STT history)
+  // This gives the model full conversation context even before turn_history is populated
+  const contextBlock = conversation_context
+    ? `\n[CONVERSATION HISTORY (last 10 turns)]:\n${conversation_context}`
+    : '';
+
   const userContent = `${kbContext}
 
 [MODE]: ${mode}
-[ACTIVE CONTEXT]: ${(problem_context ?? '').slice(0, 400)}
+[ACTIVE CONTEXT]: ${(problem_context ?? '').slice(0, 400)}${contextBlock}
 [SPEAKER]: ${speaker.toUpperCase()}
-[LIVE TRANSCRIPT]: ${transcript}`;
+[LIVE TRANSCRIPT]: ${cleanTranscript}`;
 
   const messages = [
     { role: 'system', content: systemPrompt || config.system },
-    ...(turn_history ?? []).slice(-6), // last 3 pairs
+    // BUG-3B FIX: expanded from 6 → 16 messages (last 8 pairs)
+    ...(turn_history ?? []).slice(-16),
     { role: 'user', content: userContent },
   ];
 

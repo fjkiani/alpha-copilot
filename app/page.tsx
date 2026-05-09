@@ -9,12 +9,21 @@
  * - Force-agent keys (T=terminal, R=rescue, N=negotiation, B=behavioral)
  * - Bullet highlight mode (1/2/3 keys)
  * - Ctrl+C copies current HUD to clipboard
- * - Smarter auto-stealth: 3s blur delay, not instant
  * - Session start time tracked for StatusBar timer
  * - currentAgent passed to StatusBar
  * - TurnMeta (agent, confidence, latency, truncated) stored in bulletHistory
  * - HotkeyOverlay (? key)
  * - Rescue overlay dismissal (SPACE or ESC when rescue active)
+ *
+ * BUG-1 FIX (2026-05-09): Auto-stealth now requires BOTH window.blur AND
+ *   document.hidden to be true before triggering cover mode. A simple blur
+ *   (clicking on devtools, taskbar, same-screen element) no longer triggers
+ *   stealth. Delay also raised 3s → 8s. Only a genuine tab switch or
+ *   window minimize (document.hidden=true) activates cover mode.
+ *
+ * BUG-3B FIX (2026-05-09): onFire now passes conversation_context (last 10
+ *   tagged transcript lines) to /api/stream so the LLM has full conversation
+ *   history even before turn_history is populated.
  */
 'use client';
 
@@ -92,8 +101,12 @@ export default function AlphaPage() {
   const [activeQuestion, setActiveQuestion] = useState('');
 
   // profilerState ref — allows onFire to read latest value without being in deps
-  // (profilerState is declared after onFire via useTranscription, so we use a ref bridge)
   const profilerStateRef = useRef<import('@/lib/buildSystemPrompt').ProfilerState | null>(null);
+
+  // taggedTranscriptsRef bridge — allows onFire to read latest transcript lines
+  // without capturing the transcription hook in its dependency array.
+  // Updated by the effect below whenever transcripts change.
+  const taggedTranscriptsRef = useRef<string[]>([]);
 
   // ── onFire — the STT→LLM integration seam ───────────────────────────────
   const onFire = useCallback(
@@ -103,9 +116,13 @@ export default function AlphaPage() {
       setActiveQuestion(text);
       const t0 = Date.now();
 
+      // BUG-3B FIX: build conversation_context from last 10 tagged transcript lines
+      // This gives the LLM full conversation history even before turn_history is populated
+      const conversationContext = taggedTranscriptsRef.current.slice(-10).join('\n');
+
       const completedInsight = await process(
         { text, speaker: speaker === 'candidate' ? 'CANDIDATE' : 'INTERVIEWER', timestamp: t0 },
-        '',
+        conversationContext,   // passed as problem_context → forwarded to /api/stream
         { profilerState: profilerStateRef.current, isRambling: false }
       );
 
@@ -113,7 +130,7 @@ export default function AlphaPage() {
         const meta: TurnMeta = {
           agent: alphaState.agent || 'tactical',
           urgency: alphaState.urgency,
-          confidence: undefined, // router confidence not surfaced yet — future
+          confidence: undefined,
           firstTokenMs: alphaState.latency.firstTokenMs,
           truncated: alphaState.truncated,
           timestamp: Date.now(),
@@ -134,7 +151,7 @@ export default function AlphaPage() {
 
       setActiveQuestion('');
     },
-    [process, alphaState.agent, alphaState.urgency, alphaState.latency.firstTokenMs, alphaState.truncated] // BUG-C: no alphaState.insight
+    [process, alphaState.agent, alphaState.urgency, alphaState.latency.firstTokenMs, alphaState.truncated]
   );
 
   // ── Transcription hook ───────────────────────────────────────────────────
@@ -173,6 +190,14 @@ export default function AlphaPage() {
 
   // Keep profilerStateRef in sync so onFire always reads latest value
   useEffect(() => { profilerStateRef.current = profilerState; }, [profilerState]);
+
+  // Keep taggedTranscriptsRef in sync from transcripts array
+  // (transcripts is the processed array from useTranscriptProcessor)
+  useEffect(() => {
+    taggedTranscriptsRef.current = transcripts.map(
+      (t) => `${t.speaker === 'candidate' ? 'Me' : 'Interviewer'}: ${t.text}`
+    );
+  }, [transcripts]);
 
   // Track session start time for StatusBar timer
   useEffect(() => {
@@ -339,32 +364,42 @@ export default function AlphaPage() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleKeyDown]);
 
-  // ── Auto-stealth (3s delay, not instant) ────────────────────────────────
+  // ── Auto-stealth ─────────────────────────────────────────────────────────
+  // BUG-1 FIX (2026-05-09):
+  //   OLD: window.blur alone triggered cover mode after 3s.
+  //        Problem: clicking devtools, taskbar, or any OS element fires blur
+  //        even when the user is still on the same screen.
+  //   NEW: Cover mode only activates when document.hidden becomes true
+  //        (genuine tab switch or window minimize). window.blur alone is
+  //        ignored. Delay raised to 8s as an additional buffer.
+  //        ESC or window.focus always clears cover mode immediately.
   useEffect(() => {
     if (!capabilities.autoStealth) return;
-    const handleBlur = () => {
-      stealthTimerRef.current = setTimeout(() => setCoverMode(true), 3000);
-    };
-    const handleFocus = () => {
-      if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
-      setCoverMode(false);
-    };
+
     const handleVis = () => {
       if (document.hidden) {
-        stealthTimerRef.current = setTimeout(() => setCoverMode(true), 3000);
+        // Genuine tab switch or window minimize — start 8s stealth timer
+        stealthTimerRef.current = setTimeout(() => setCoverMode(true), 8000);
       } else {
+        // Tab is visible again — cancel timer and clear cover immediately
         if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
         setCoverMode(false);
       }
     };
-    window.addEventListener('blur', handleBlur);
-    window.addEventListener('focus', handleFocus);
+
+    // focus always clears cover (e.g. user switches back to tab)
+    const handleFocus = () => {
+      if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
+      setCoverMode(false);
+    };
+
     document.addEventListener('visibilitychange', handleVis);
+    window.addEventListener('focus', handleFocus);
+
     return () => {
       if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
-      window.removeEventListener('blur', handleBlur);
-      window.removeEventListener('focus', handleFocus);
       document.removeEventListener('visibilitychange', handleVis);
+      window.removeEventListener('focus', handleFocus);
     };
   }, [capabilities.autoStealth]);
 
