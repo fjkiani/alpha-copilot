@@ -7,22 +7,9 @@
  * Returns: merged profiler state
  */
 import { buildProfilerPrompt, buildProfilerUserMessage, type ProfilerState, type KnowledgeBase } from '@/lib/buildSystemPrompt';
+import KB from '@/lib/knowledge_base.json';
 
-// Knowledge base is loaded from lib/knowledge_base.json at build time
-// In production, this is bundled. In dev, it's read from disk.
-let _kb: KnowledgeBase | null = null;
-function getKnowledgeBase(): KnowledgeBase {
-  if (_kb) return _kb;
-  try {
-    // Dynamic require for server-side only
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const kb = require('@/lib/knowledge_base.json') as KnowledgeBase;
-    _kb = kb;
-    return kb;
-  } catch {
-    return {};
-  }
-}
+export const runtime = 'edge';
 
 interface ProfilerDelta {
   new_interviewer_insights?: Array<{
@@ -68,7 +55,7 @@ function deepMergeProfilerState(
   if (delta.new_pillars_deployed?.length) {
     const deployed = new Set(state.alpha_telemetry?.pillars_deployed ?? []);
     for (const p of delta.new_pillars_deployed) deployed.add(p);
-    const allPillars = getKnowledgeBase()?.candidate?.campaign_pillars ?? [];
+    const allPillars = (KB as unknown as KnowledgeBase)?.candidate?.campaign_pillars ?? [];
     state.alpha_telemetry = {
       ...state.alpha_telemetry,
       pillars_deployed: [...deployed],
@@ -113,8 +100,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const kb = getKnowledgeBase();
-    const systemPrompt = buildProfilerPrompt(kb);
+    const systemPrompt = buildProfilerPrompt(KB as unknown as KnowledgeBase);
     const userMessage = buildProfilerUserMessage(currentProfileState, latestChunk);
 
     const messages = [

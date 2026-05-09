@@ -3,6 +3,8 @@
  * Generates a temporary AssemblyAI auth token for browser-side WebSocket.
  * The real API key stays server-side — the browser only sees a short-lived token.
  */
+export const runtime = 'edge';
+
 export async function POST() {
   const apiKey = process.env.ASSEMBLYAI_API_KEY;
   if (!apiKey) {

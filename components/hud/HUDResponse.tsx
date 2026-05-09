@@ -40,7 +40,8 @@ function LatencyRing({ ms }: { ms: number }) {
   const dash = circ * (1 - pct);
 
   return (
-    <svg width="20" height="20" viewBox="0 0 20 20" className="shrink-0" title={`${ms}ms to first token`}>
+    <svg width="20" height="20" viewBox="0 0 20 20" className="shrink-0" aria-label={`${ms}ms to first token`}>
+      <title>{`${ms}ms to first token`}</title>
       <circle cx="10" cy="10" r={r} fill="none" stroke="#27272a" strokeWidth="2.5" />
       <circle
         cx="10" cy="10" r={r}

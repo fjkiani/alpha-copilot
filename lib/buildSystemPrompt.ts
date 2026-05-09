@@ -36,6 +36,12 @@ export interface KnowledgeBase {
     max_bullets?: number;
     tone?: string;
   };
+  playbook?: {
+    opening_hooks?: string[];
+    closing_anchors?: string[];
+    pivot_phrases?: string[];
+    power_stats?: string[];
+  };
 }
 
 export interface ProfilerState {

@@ -1,0 +1,6 @@
+{
+  "functions": {
+    "app/api/stream/route.ts": { "maxDuration": 60 },
+    "app/api/followup/route.ts": { "maxDuration": 60 }
+  }
+}

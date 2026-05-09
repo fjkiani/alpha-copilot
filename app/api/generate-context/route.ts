@@ -8,6 +8,8 @@
  * Output: { keyterms: string[], prompt: string }
  */
 
+export const runtime = 'edge';
+
 function getSystemPrompt(): string {
   return `You are a technical interview preparation assistant. Given a job description or company context, extract two things:
 

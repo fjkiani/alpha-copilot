@@ -7,6 +7,8 @@
  * For Vercel serverless, replace with Vercel KV or pass context from client.
  */
 
+export const runtime = 'edge';
+
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 const MAX_EVENTS = 80;
 const QUESTION_MARKERS = [

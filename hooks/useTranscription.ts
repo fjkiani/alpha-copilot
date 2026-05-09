@@ -37,10 +37,10 @@ import type { Capabilities } from '@/components/CapabilityPanel';
 
 export interface BulletHistoryEntry {
   question: string;
-  bullets: string[];
-  rawResponse: string;
-  latency: number;
-  timestamp: number;
+  bullets?: string[];
+  rawResponse?: string;
+  latency?: number;
+  timestamp?: number;
 }
 
 export interface TranscriptionHook {

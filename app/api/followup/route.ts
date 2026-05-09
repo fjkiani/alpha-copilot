@@ -5,19 +5,10 @@
  *
  * Accepts: { history: [...], profilerState: object|null }
  */
-import { buildFollowUpPrompt, type ProfilerState } from '@/lib/buildSystemPrompt';
+import { buildFollowUpPrompt, type ProfilerState, type KnowledgeBase } from '@/lib/buildSystemPrompt';
+import KB from '@/lib/knowledge_base.json';
 
-let _kb: Record<string, unknown> | null = null;
-function getKnowledgeBase(): Record<string, unknown> {
-  if (_kb) return _kb;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    _kb = require('@/lib/knowledge_base.json') as Record<string, unknown>;
-    return _kb;
-  } catch {
-    return {};
-  }
-}
+export const runtime = 'edge';
 
 export async function POST(request: Request) {
   try {
@@ -30,8 +21,7 @@ export async function POST(request: Request) {
       return Response.json({ error: 'No conversation history to analyze' }, { status: 400 });
     }
 
-    const kb = getKnowledgeBase();
-    const systemPrompt = buildFollowUpPrompt(kb as Parameters<typeof buildFollowUpPrompt>[0], profilerState);
+    const systemPrompt = buildFollowUpPrompt(KB as unknown as KnowledgeBase, profilerState);
 
     const transcript = history
       .map((h, i) => {
