@@ -365,40 +365,71 @@ export default function AlphaPage() {
   }, [handleKeyDown]);
 
   // ── Auto-stealth ─────────────────────────────────────────────────────────
-  // BUG-1 FIX (2026-05-09):
-  //   OLD: window.blur alone triggered cover mode after 3s.
-  //        Problem: clicking devtools, taskbar, or any OS element fires blur
-  //        even when the user is still on the same screen.
-  //   NEW: Cover mode only activates when document.hidden becomes true
-  //        (genuine tab switch or window minimize). window.blur alone is
-  //        ignored. Delay raised to 8s as an additional buffer.
-  //        ESC or window.focus always clears cover mode immediately.
+  // Architecture: dual-signal detection to handle all OS/browser combinations.
+  //
+  // Signal A — visibilitychange (document.hidden=true):
+  //   Fires on: tab switch in same browser, window minimize.
+  //   Does NOT fire on: macOS Cmd+Tab to another app while browser is visible.
+  //
+  // Signal B — blur + mouseLeave compound:
+  //   window.blur fires on ANY focus loss (too noisy alone).
+  //   document.mouseleave fires when cursor exits the browser viewport.
+  //   BOTH must be true simultaneously → genuine app switch (macOS Cmd+Tab).
+  //   Either alone is ignored.
+  //
+  // Clear signals: window.focus OR visibilitychange(visible) → immediate clear.
+  //
+  // Delay: 8s on all paths — gives user time to alt-tab back without cover.
+  // ESC key always toggles cover mode manually (handled in handleKeyDown).
   useEffect(() => {
     if (!capabilities.autoStealth) return;
 
+    // Track mouse-in-window state for compound blur detection
+    let mouseInWindow = true;
+
+    const handleMouseEnter = () => { mouseInWindow = true; };
+    const handleMouseLeave = () => { mouseInWindow = false; };
+
+    // Signal A: genuine tab switch or minimize
     const handleVis = () => {
       if (document.hidden) {
-        // Genuine tab switch or window minimize — start 8s stealth timer
+        if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
         stealthTimerRef.current = setTimeout(() => setCoverMode(true), 8000);
       } else {
-        // Tab is visible again — cancel timer and clear cover immediately
         if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
         setCoverMode(false);
       }
     };
 
-    // focus always clears cover (e.g. user switches back to tab)
+    // Signal B: blur + mouse-left-window = macOS Cmd+Tab to another app
+    const handleBlur = () => {
+      if (!mouseInWindow) {
+        // Mouse already left the viewport — this is a real app switch
+        if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
+        stealthTimerRef.current = setTimeout(() => setCoverMode(true), 8000);
+      }
+      // blur with mouse still in window = clicking devtools/taskbar — ignore
+    };
+
+    // Any focus recovery clears cover immediately
     const handleFocus = () => {
+      mouseInWindow = true;
       if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
       setCoverMode(false);
     };
 
     document.addEventListener('visibilitychange', handleVis);
+    document.addEventListener('mouseenter', handleMouseEnter);
+    document.addEventListener('mouseleave', handleMouseLeave);
+    window.addEventListener('blur', handleBlur);
     window.addEventListener('focus', handleFocus);
 
     return () => {
       if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
       document.removeEventListener('visibilitychange', handleVis);
+      document.removeEventListener('mouseenter', handleMouseEnter);
+      document.removeEventListener('mouseleave', handleMouseLeave);
+      window.removeEventListener('blur', handleBlur);
       window.removeEventListener('focus', handleFocus);
     };
   }, [capabilities.autoStealth]);

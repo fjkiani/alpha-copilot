@@ -12,8 +12,15 @@
  * BUG-3B FIX (2026-05-09):
  *   - problem_context (conversation_context from page.tsx) is now forwarded
  *     to /api/stream as both problem_context AND conversation_context fields.
- *     This gives the LLM the last 10 tagged transcript lines as raw context.
- *   - cappedContext limit raised 500 → 2000 chars to accommodate 10 transcript lines.
+ *   - cappedContext limit raised 500 → 2000 chars.
+ *
+ * DEEP RESCUE FIX (2026-05-09):
+ *   - [DEEP_RESCUE] prefix in chunk.text bypasses the router entirely.
+ *     Router would classify the rescue context as chitchat/low-confidence
+ *     and silently drop it. Fast-path forces agent='rescue', urgency='rescue',
+ *     confidence=1.0 — identical to the is_rambling fast-path pattern.
+ *   - isDeepRescue flag forwarded to /api/stream client_telemetry so
+ *     buildSystemPromptForAgent() selects buildDeepRescuePrompt().
  */
 'use client';
 
@@ -45,6 +52,18 @@ const INITIAL_STATE: AlphaState = {
   latency: { routeMs: null, firstTokenMs: null, totalMs: null },
 };
 
+// ── Deep rescue fast-path route (bypasses LLM router) ────────────────────────
+// Mirrors the is_rambling fast-path in /api/route/route.ts.
+// Router would see [DEEP_RESCUE]\n... as chitchat and silently drop it.
+const DEEP_RESCUE_ROUTE = {
+  intent: 'rescue',
+  agent: 'rescue',
+  urgency: 'rescue',
+  confidence: 1.0,
+  phase_hint: 'rescue',
+  _fastPath: true,
+} as const;
+
 export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
   const [state, setState] = useState<AlphaState>(INITIAL_STATE);
   const abortRef = useRef<AbortController | null>(null);
@@ -67,9 +86,14 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
     }
   ): Promise<string | null> => {
     const t0 = performance.now();
-    // BUG-3B FIX: raised from 500 → 2000 to accommodate 10 transcript lines
     const cappedContext = problemContext.slice(0, 2000);
     const { profilerState = null, isRambling = false, retryCount = 0 } = opts ?? {};
+
+    // ── Deep rescue fast-path: bypass router entirely ──────────────────────
+    // [DEEP_RESCUE] prefix means the user manually triggered emergency support.
+    // The router would classify this as chitchat/low-confidence and drop it.
+    // Force-route directly to the rescue agent with full confidence.
+    const isDeepRescue = chunk.text.startsWith('[DEEP_RESCUE]');
 
     // ── Step 1: Route ──────────────────────────────────────────────────────
     let route: {
@@ -79,36 +103,43 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
       confidence: number;
       phase_hint?: string;
       _fallback?: boolean;
+      _fastPath?: boolean;
     };
 
-    try {
-      const routeRes = await fetch('/api/route', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          transcript: chunk.text,
-          speaker: chunk.speaker,
-          mode,
-          context_summary: cappedContext.slice(0, 200),
-          is_rambling: isRambling,
-        }),
-      });
+    if (isDeepRescue) {
+      // Skip the router — deep rescue is always valid
+      route = DEEP_RESCUE_ROUTE;
+      console.log('[useAlpha] DEEP_RESCUE fast-path — bypassing router');
+    } else {
+      try {
+        const routeRes = await fetch('/api/route', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            transcript: chunk.text,
+            speaker: chunk.speaker,
+            mode,
+            context_summary: cappedContext.slice(0, 200),
+            is_rambling: isRambling,
+          }),
+        });
 
-      if (!routeRes.ok) throw new Error(`Router returned ${routeRes.status}`);
-      route = await routeRes.json();
-    } catch (err) {
-      console.error('[useAlpha] Route failed:', err);
-      setState(prev => ({ ...prev, error: 'Router unavailable. Check API key.' }));
-      return null;
+        if (!routeRes.ok) throw new Error(`Router returned ${routeRes.status}`);
+        route = await routeRes.json();
+      } catch (err) {
+        console.error('[useAlpha] Route failed:', err);
+        setState(prev => ({ ...prev, error: 'Router unavailable. Check API key.' }));
+        return null;
+      }
+
+      // Skip chitchat and very low confidence (only for non-rescue paths)
+      if (route.intent === 'chitchat' || route.confidence < 0.5) {
+        console.log('[useAlpha] Skipping:', route.intent, 'confidence:', route.confidence);
+        return null;
+      }
     }
 
     const routeMs = Math.round(performance.now() - t0);
-
-    // Skip chitchat and very low confidence
-    if (route.intent === 'chitchat' || route.confidence < 0.5) {
-      console.log('[useAlpha] Skipping:', route.intent, 'confidence:', route.confidence);
-      return null;
-    }
 
     // ── Step 2: Abort in-flight ────────────────────────────────────────────
     abortRef.current?.abort();
@@ -136,13 +167,15 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
           transcript: chunk.text,
           mode,
           problem_context: cappedContext,
-          // BUG-3B FIX: also send as conversation_context so stream route
-          // can inject it as [CONVERSATION HISTORY] block in the user message
           conversation_context: cappedContext,
           turn_history: turnHistoryRef.current,
           profiler_state: profilerState,
           speaker: chunk.speaker.toLowerCase(),
-          client_telemetry: { isRambling, isRescue: route.urgency === 'rescue' },
+          client_telemetry: {
+            isRambling,
+            isRescue: route.urgency === 'rescue' && !isDeepRescue,
+            isDeepRescue,
+          },
         }),
       });
     } catch (err: unknown) {
@@ -231,15 +264,19 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
               return process(chunk, problemContext, { profilerState, isRambling, retryCount: retryCount + 1 });
             }
 
-            // Persist turn history (last 8 pairs = 16 messages, matching stream route window)
-            turnHistoryRef.current = [
-              ...turnHistoryRef.current.slice(-14),
-              { role: 'user', content: chunk.text },
-              { role: 'assistant', content: fullInsight },
-            ];
-            try {
-              sessionStorage.setItem(`alpha_history_${mode}`, JSON.stringify(turnHistoryRef.current));
-            } catch { /* storage full */ }
+            // Persist turn history (last 8 pairs = 16 messages)
+            // Deep rescue responses are NOT added to turn history — they are
+            // triage outputs, not part of the interview conversation thread.
+            if (!isDeepRescue) {
+              turnHistoryRef.current = [
+                ...turnHistoryRef.current.slice(-14),
+                { role: 'user', content: chunk.text },
+                { role: 'assistant', content: fullInsight },
+              ];
+              try {
+                sessionStorage.setItem(`alpha_history_${mode}`, JSON.stringify(turnHistoryRef.current));
+              } catch { /* storage full */ }
+            }
 
             return fullInsight;
 
