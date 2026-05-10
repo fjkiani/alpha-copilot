@@ -1,14 +1,15 @@
 /**
- * HUDResponse — Tank-grade master router
+ * HUDResponse — Tank-grade master router (inline-only renderer)
  *
- * Upgrades vs v1:
- * - Animated section reveals (staggered 80ms per section)
- * - Confidence bar under each response
- * - Latency ring (time-to-first-token vs 2500ms SLA)
- * - Rescue: full-screen overlay mode
- * - Override: pulsing red border
- * - Truncation warning banner
- * - Agent badge
+ * RESCUE MODAL FIX (2026-05-09):
+ *   - Removed the fixed inset-0 rescue overlay from this component entirely.
+ *     It was rendered inside ConversationTurn → HistoricalThread → overflow-y-auto,
+ *     which means CSS position:fixed was clipped by the scroll container ancestor.
+ *     This caused the broken partial-overlay appearance.
+ *   - Rescue responses now render inline via HUDRescue (already existed, correct).
+ *   - The full-screen overlay is now a root-level portal in page.tsx, driven by
+ *     rescueOverlay state — completely outside any scroll/overflow container.
+ *   - HUDResponse is now a pure inline renderer. No full-screen takeovers.
  */
 'use client';
 
@@ -125,44 +126,15 @@ export default function HUDResponse({
     );
   }
 
-  // Rescue: full-screen overlay
-  if (parsed.phase === 'rescue' || urgency === 'rescue') {
-    return (
-      <div className="fixed inset-0 z-50 bg-zinc-950/95 flex flex-col items-center justify-center p-8 backdrop-blur-sm">
-        <div className="max-w-2xl w-full space-y-6">
-          <div className="flex items-center gap-3">
-            <span className="text-red-500 text-2xl animate-pulse">🆘</span>
-            <span className="text-red-400 text-sm font-semibold uppercase tracking-widest">Rescue Mode</span>
-          </div>
-          {parsed.rescue && (
-            <div className="bg-red-950/60 border border-red-700 rounded-xl p-6">
-              <p className="text-white text-3xl font-bold leading-tight tracking-tight">
-                {parsed.rescue}
-              </p>
-            </div>
-          )}
-          {parsed.pivot && (
-            <div className="border-l-2 border-zinc-700 pl-4">
-              <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Then pivot to</p>
-              <p className="text-zinc-300 text-lg">{parsed.pivot}</p>
-            </div>
-          )}
-          {(parsed as { stall?: string }).stall && (
-            <div className="border-l-2 border-zinc-700 pl-4">
-              <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Stall phrase</p>
-              <p className="text-zinc-400 italic">{(parsed as { stall?: string }).stall}</p>
-            </div>
-          )}
-          <p className="text-xs text-zinc-700 text-center">Press SPACE or ESC to dismiss</p>
-        </div>
-      </div>
-    );
-  }
-
   // Override: pulsing red border wrapper
   const isOverride = parsed.phase === 'override' || urgency === 'override';
 
+  // ── Content router ────────────────────────────────────────────────────────
+  // Rescue renders inline via HUDRescue.
+  // The full-screen overlay is handled by the root portal in page.tsx.
+  // This keeps HUDResponse as a pure inline renderer with no fixed positioning.
   const content = (() => {
+    if (parsed.phase === 'rescue' || urgency === 'rescue') return <HUDRescue parsed={parsed} />;
     if (parsed.phase === 'override') return <HUDOverride parsed={parsed} />;
     if (parsed.phase === 'terminal') return <HUDTerminal parsed={parsed} />;
     if (parsed.phase === 'support') return <HUDSupport parsed={parsed} />;

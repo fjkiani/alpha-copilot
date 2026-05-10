@@ -16,11 +16,13 @@
  *
  * DEEP RESCUE FIX (2026-05-09):
  *   - [DEEP_RESCUE] prefix in chunk.text bypasses the router entirely.
- *     Router would classify the rescue context as chitchat/low-confidence
- *     and silently drop it. Fast-path forces agent='rescue', urgency='rescue',
- *     confidence=1.0 — identical to the is_rambling fast-path pattern.
- *   - isDeepRescue flag forwarded to /api/stream client_telemetry so
- *     buildSystemPromptForAgent() selects buildDeepRescuePrompt().
+ *
+ * RESCUE MODAL FIX (2026-05-09):
+ *   - urgency='rescue' is now auto-reset to 'normal' 4s after streaming ends.
+ *     Previously it stayed 'rescue' forever, keeping the overlay stuck on screen.
+ *   - clearRescue() exposed for immediate dismiss via SPACE/ESC.
+ *   - rescueDismissTimerRef tracks the auto-dismiss timeout so it can be
+ *     cancelled if the user manually dismisses before the 4s window.
  */
 'use client';
 
@@ -52,9 +54,11 @@ const INITIAL_STATE: AlphaState = {
   latency: { routeMs: null, firstTokenMs: null, totalMs: null },
 };
 
+// How long the rescue overlay stays visible after streaming completes
+// before auto-dismissing. 4s gives enough time to read [RESCUE] words.
+const RESCUE_AUTO_DISMISS_MS = 4000;
+
 // ── Deep rescue fast-path route (bypasses LLM router) ────────────────────────
-// Mirrors the is_rambling fast-path in /api/route/route.ts.
-// Router would see [DEEP_RESCUE]\n... as chitchat and silently drop it.
 const DEEP_RESCUE_ROUTE = {
   intent: 'rescue',
   agent: 'rescue',
@@ -67,6 +71,8 @@ const DEEP_RESCUE_ROUTE = {
 export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
   const [state, setState] = useState<AlphaState>(INITIAL_STATE);
   const abortRef = useRef<AbortController | null>(null);
+  // Tracks the auto-dismiss timer so it can be cancelled on manual dismiss
+  const rescueDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const turnHistoryRef = useRef<Array<{ role: string; content: string }>>((() => {
     if (typeof window === 'undefined') return [];
@@ -75,6 +81,18 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
       return saved ? JSON.parse(saved) : [];
     } catch { return []; }
   })());
+
+  // ── clearRescue — immediate dismiss (SPACE / ESC) ─────────────────────────
+  // Cancels the auto-dismiss timer and resets urgency to 'normal' immediately.
+  const clearRescue = useCallback(() => {
+    if (rescueDismissTimerRef.current) {
+      clearTimeout(rescueDismissTimerRef.current);
+      rescueDismissTimerRef.current = null;
+    }
+    setState(prev =>
+      prev.urgency === 'rescue' ? { ...prev, urgency: 'normal' } : prev
+    );
+  }, []);
 
   const process = useCallback(async (
     chunk: TranscriptChunk,
@@ -89,10 +107,12 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
     const cappedContext = problemContext.slice(0, 2000);
     const { profilerState = null, isRambling = false, retryCount = 0 } = opts ?? {};
 
-    // ── Deep rescue fast-path: bypass router entirely ──────────────────────
-    // [DEEP_RESCUE] prefix means the user manually triggered emergency support.
-    // The router would classify this as chitchat/low-confidence and drop it.
-    // Force-route directly to the rescue agent with full confidence.
+    // Cancel any pending rescue auto-dismiss from a previous rescue
+    if (rescueDismissTimerRef.current) {
+      clearTimeout(rescueDismissTimerRef.current);
+      rescueDismissTimerRef.current = null;
+    }
+
     const isDeepRescue = chunk.text.startsWith('[DEEP_RESCUE]');
 
     // ── Step 1: Route ──────────────────────────────────────────────────────
@@ -107,7 +127,6 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
     };
 
     if (isDeepRescue) {
-      // Skip the router — deep rescue is always valid
       route = DEEP_RESCUE_ROUTE;
       console.log('[useAlpha] DEEP_RESCUE fast-path — bypassing router');
     } else {
@@ -132,7 +151,6 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
         return null;
       }
 
-      // Skip chitchat and very low confidence (only for non-rescue paths)
       if (route.intent === 'chitchat' || route.confidence < 0.5) {
         console.log('[useAlpha] Skipping:', route.intent, 'confidence:', route.confidence);
         return null;
@@ -185,7 +203,6 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
       return null;
     }
 
-    // 204 = deduplicated request, silently ignore
     if (streamRes.status === 204) {
       setState(prev => ({ ...prev, isStreaming: false }));
       return null;
@@ -218,6 +235,8 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
     let firstTokenReceived = false;
     let wasTruncated = false;
     const tStream = performance.now();
+    // Capture urgency at stream-start so the done handler knows whether to schedule dismiss
+    const streamUrgency = route.urgency;
 
     try {
       while (true) {
@@ -258,15 +277,26 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
             const totalMs = Math.round(performance.now() - t0);
             setState(prev => ({ ...prev, isStreaming: false, latency: { ...prev.latency, totalMs } }));
 
-            // Retry once if truncated and not already retrying
+            // ── RESCUE AUTO-DISMISS ────────────────────────────────────────
+            // After rescue streaming completes, schedule urgency reset to 'normal'
+            // after RESCUE_AUTO_DISMISS_MS. This collapses the overlay automatically
+            // so the user doesn't have to press SPACE/ESC every time.
+            // The timer is stored in rescueDismissTimerRef so clearRescue() can
+            // cancel it if the user dismisses manually before the window expires.
+            if (streamUrgency === 'rescue') {
+              rescueDismissTimerRef.current = setTimeout(() => {
+                rescueDismissTimerRef.current = null;
+                setState(prev =>
+                  prev.urgency === 'rescue' ? { ...prev, urgency: 'normal' } : prev
+                );
+              }, RESCUE_AUTO_DISMISS_MS);
+            }
+
             if (wasTruncated && retryCount < 1) {
               console.warn('[useAlpha] Response truncated — retrying with higher budget');
               return process(chunk, problemContext, { profilerState, isRambling, retryCount: retryCount + 1 });
             }
 
-            // Persist turn history (last 8 pairs = 16 messages)
-            // Deep rescue responses are NOT added to turn history — they are
-            // triage outputs, not part of the interview conversation thread.
             if (!isDeepRescue) {
               turnHistoryRef.current = [
                 ...turnHistoryRef.current.slice(-14),
@@ -305,10 +335,14 @@ export function useAlpha(mode: 'interview' | 'sales' | 'demo') {
 
   const reset = useCallback(() => {
     abortRef.current?.abort();
+    if (rescueDismissTimerRef.current) {
+      clearTimeout(rescueDismissTimerRef.current);
+      rescueDismissTimerRef.current = null;
+    }
     turnHistoryRef.current = [];
     try { sessionStorage.removeItem(`alpha_history_${mode}`); } catch { /* ignore */ }
     setState(INITIAL_STATE);
   }, [mode]);
 
-  return { state, process, dismiss, reset };
+  return { state, process, dismiss, reset, clearRescue };
 }

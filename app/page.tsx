@@ -15,15 +15,24 @@
  * - HotkeyOverlay (? key)
  * - Rescue overlay dismissal (SPACE or ESC when rescue active)
  *
- * BUG-1 FIX (2026-05-09): Auto-stealth now requires BOTH window.blur AND
- *   document.hidden to be true before triggering cover mode. A simple blur
- *   (clicking on devtools, taskbar, same-screen element) no longer triggers
- *   stealth. Delay also raised 3s → 8s. Only a genuine tab switch or
- *   window minimize (document.hidden=true) activates cover mode.
+ * BUG-1 FIX (2026-05-09): Auto-stealth dual-signal architecture.
  *
- * BUG-3B FIX (2026-05-09): onFire now passes conversation_context (last 10
- *   tagged transcript lines) to /api/stream so the LLM has full conversation
- *   history even before turn_history is populated.
+ * BUG-3B FIX (2026-05-09): conversation_context injected into onFire.
+ *
+ * RESCUE MODAL FIX (2026-05-09):
+ *   Root cause: the rescue overlay was rendered inside ConversationTurn →
+ *   HistoricalThread → overflow-y-auto. CSS position:fixed inside an overflow
+ *   ancestor is clipped — it never covered the full screen. This caused the
+ *   broken partial/laggy overlay appearance.
+ *
+ *   Fix: rescueOverlay state drives a portal rendered as a SIBLING of the
+ *   root div — completely outside any scroll/overflow container. The overlay
+ *   is populated from alphaState.insight during rescue streaming, auto-dismisses
+ *   4s after streaming ends (via useAlpha clearRescue), and can be dismissed
+ *   immediately with SPACE or ESC.
+ *
+ *   HUDResponse no longer renders any fixed overlay. It is a pure inline
+ *   renderer. Rescue responses in the history thread render inline via HUDRescue.
  */
 'use client';
 
@@ -32,6 +41,7 @@ import { useAlpha } from '@/hooks/useAlpha';
 import { useTranscription } from '@/hooks/useTranscription';
 import type { SpeakerRole } from '@/hooks/useTranscriptProcessor';
 import type { TurnMeta } from '@/components/ConversationTurn';
+import { parseHUDSections } from '@/lib/parseHUD';
 
 import CoverPage from '@/components/CoverPage';
 import RamblingBanner from '@/components/RamblingBanner';
@@ -48,6 +58,78 @@ import { ModeSelector } from '@/components/ModeSelector';
 
 type Mode = 'interview' | 'sales' | 'demo';
 type ForceAgent = 'terminal' | 'rescue' | 'negotiation' | 'behavioral' | null;
+
+// ── Root-level rescue overlay ─────────────────────────────────────────────────
+// Rendered as a sibling of the main div — outside all scroll/overflow containers.
+// This is the ONLY place the full-screen rescue overlay is rendered.
+// HUDResponse no longer renders any fixed overlay.
+function RescueOverlay({
+  rescue,
+  pivot,
+  isStreaming,
+  onDismiss,
+}: {
+  rescue: string;
+  pivot: string;
+  isStreaming: boolean;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 bg-zinc-950/95 flex flex-col items-center justify-center p-8 backdrop-blur-sm">
+      <div className="max-w-2xl w-full space-y-6">
+        {/* Header */}
+        <div className="flex items-center gap-3">
+          <span className="text-red-500 text-2xl animate-pulse">🆘</span>
+          <span className="text-red-400 text-sm font-semibold uppercase tracking-widest">
+            Rescue Mode
+          </span>
+          {isStreaming && (
+            <span className="ml-auto text-xs text-green-500 animate-pulse font-mono">streaming...</span>
+          )}
+        </div>
+
+        {/* [RESCUE] — the exact words to say */}
+        {rescue ? (
+          <div className="bg-red-950/60 border border-red-700 rounded-xl p-6">
+            <p className="text-white text-3xl font-bold leading-tight tracking-tight">
+              {rescue}
+            </p>
+          </div>
+        ) : (
+          // Skeleton while streaming hasn't produced [RESCUE] content yet
+          <div className="bg-red-950/30 border border-red-900 rounded-xl p-6 animate-pulse">
+            <div className="h-8 bg-red-900/40 rounded w-3/4" />
+          </div>
+        )}
+
+        {/* [THE PIVOT] */}
+        {pivot && (
+          <div className="border-l-2 border-zinc-700 pl-4">
+            <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Then pivot to</p>
+            <p className="text-zinc-300 text-lg">{pivot}</p>
+          </div>
+        )}
+
+        {/* Dismiss hint */}
+        <p className="text-xs text-zinc-700 text-center">
+          {isStreaming ? 'Generating...' : 'Press SPACE or ESC to dismiss'}
+        </p>
+
+        {/* Manual dismiss button */}
+        {!isStreaming && (
+          <div className="flex justify-center">
+            <button
+              onClick={onDismiss}
+              className="px-6 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-400 text-sm rounded-lg transition-colors"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 export default function AlphaPage() {
   // ── Mode & capabilities ──────────────────────────────────────────────────
@@ -72,12 +154,17 @@ export default function AlphaPage() {
   const [highlightBullet, setHighlightBullet] = useState<number | null>(null);
   const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
 
+  // ── Rescue overlay state ─────────────────────────────────────────────────
+  // Driven by alphaState.urgency + alphaState.insight.
+  // Active when urgency='rescue'. Dismissed by clearRescue() or SPACE/ESC.
+  const [rescueOverlayActive, setRescueOverlayActive] = useState(false);
+
   const toggleCapability = useCallback((key: keyof Capabilities) => {
     setCapabilities(prev => ({ ...prev, [key]: !prev[key] }));
   }, []);
 
   // ── Alpha LLM hook ───────────────────────────────────────────────────────
-  const { state: alphaState, process, dismiss, reset: resetAlpha } = useAlpha(mode);
+  const { state: alphaState, process, dismiss, reset: resetAlpha, clearRescue } = useAlpha(mode);
 
   // Sync refs for gate integration (BUG-B fix: set synchronously in onFire)
   const copilotFiringRef = useRef(false);
@@ -95,6 +182,30 @@ export default function AlphaPage() {
     }
   }, [alphaState.isStreaming, alphaState.insight]);
 
+  // ── Rescue overlay lifecycle ─────────────────────────────────────────────
+  // Open when urgency becomes 'rescue'. Close when it returns to 'normal'.
+  // This is the single source of truth for overlay visibility.
+  useEffect(() => {
+    if (alphaState.urgency === 'rescue') {
+      setRescueOverlayActive(true);
+    } else {
+      setRescueOverlayActive(false);
+    }
+  }, [alphaState.urgency]);
+
+  // Parse rescue content live from streaming insight
+  const rescueParsed = rescueOverlayActive
+    ? parseHUDSections(alphaState.insight)
+    : null;
+  const rescueText = rescueParsed?.rescue ?? '';
+  const pivotText = rescueParsed?.pivot ?? '';
+
+  // Dismiss handler — clears both the overlay and the urgency state in useAlpha
+  const handleRescueDismiss = useCallback(() => {
+    clearRescue();
+    setRescueOverlayActive(false);
+  }, [clearRescue]);
+
   // ── Bullet history ───────────────────────────────────────────────────────
   const bulletHistoryRef = useRef<HistoryEntry[]>([]);
   const [bulletHistory, setBulletHistory] = useState<HistoryEntry[]>([]);
@@ -104,25 +215,20 @@ export default function AlphaPage() {
   const profilerStateRef = useRef<import('@/lib/buildSystemPrompt').ProfilerState | null>(null);
 
   // taggedTranscriptsRef bridge — allows onFire to read latest transcript lines
-  // without capturing the transcription hook in its dependency array.
-  // Updated by the effect below whenever transcripts change.
   const taggedTranscriptsRef = useRef<string[]>([]);
 
   // ── onFire — the STT→LLM integration seam ───────────────────────────────
   const onFire = useCallback(
     async (text: string, speaker: SpeakerRole) => {
-      // BUG-B fix: synchronous guard
       copilotFiringRef.current = true;
       setActiveQuestion(text);
       const t0 = Date.now();
 
-      // BUG-3B FIX: build conversation_context from last 10 tagged transcript lines
-      // This gives the LLM full conversation history even before turn_history is populated
       const conversationContext = taggedTranscriptsRef.current.slice(-10).join('\n');
 
       const completedInsight = await process(
         { text, speaker: speaker === 'candidate' ? 'CANDIDATE' : 'INTERVIEWER', timestamp: t0 },
-        conversationContext,   // passed as problem_context → forwarded to /api/stream
+        conversationContext,
         { profilerState: profilerStateRef.current, isRambling: false }
       );
 
@@ -192,7 +298,6 @@ export default function AlphaPage() {
   useEffect(() => { profilerStateRef.current = profilerState; }, [profilerState]);
 
   // Keep taggedTranscriptsRef in sync from transcripts array
-  // (transcripts is the processed array from useTranscriptProcessor)
   useEffect(() => {
     taggedTranscriptsRef.current = transcripts.map(
       (t) => `${t.speaker === 'candidate' ? 'Me' : 'Interviewer'}: ${t.text}`
@@ -320,12 +425,20 @@ export default function AlphaPage() {
     // Global: ESC always works
     if (e.key === 'Escape') {
       if (showHotkeys) { setShowHotkeys(false); return; }
-      if (alphaState.urgency === 'rescue') { dismiss(); return; }
+      // Dismiss rescue overlay if active
+      if (rescueOverlayActive) { handleRescueDismiss(); return; }
       setCoverMode(m => !m);
       return;
     }
 
     if (inInput) return;
+
+    // SPACE = dismiss rescue overlay (when active)
+    if (e.code === 'Space' && rescueOverlayActive) {
+      e.preventDefault();
+      handleRescueDismiss();
+      return;
+    }
 
     // ? = hotkey overlay
     if (e.key === '?') { e.preventDefault(); setShowHotkeys(m => !m); return; }
@@ -357,7 +470,7 @@ export default function AlphaPage() {
     if ((e.code === 'Backspace' || e.code === 'Delete') && e.target === document.body) {
       e.preventDefault(); flushActiveContext(); return;
     }
-  }, [showHotkeys, alphaState.urgency, dismiss, copyCurrentHUD, toggleCapability, flushActiveContext]);
+  }, [showHotkeys, rescueOverlayActive, handleRescueDismiss, copyCurrentHUD, toggleCapability, flushActiveContext]);
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown);
@@ -365,32 +478,15 @@ export default function AlphaPage() {
   }, [handleKeyDown]);
 
   // ── Auto-stealth ─────────────────────────────────────────────────────────
-  // Architecture: dual-signal detection to handle all OS/browser combinations.
-  //
-  // Signal A — visibilitychange (document.hidden=true):
-  //   Fires on: tab switch in same browser, window minimize.
-  //   Does NOT fire on: macOS Cmd+Tab to another app while browser is visible.
-  //
-  // Signal B — blur + mouseLeave compound:
-  //   window.blur fires on ANY focus loss (too noisy alone).
-  //   document.mouseleave fires when cursor exits the browser viewport.
-  //   BOTH must be true simultaneously → genuine app switch (macOS Cmd+Tab).
-  //   Either alone is ignored.
-  //
-  // Clear signals: window.focus OR visibilitychange(visible) → immediate clear.
-  //
-  // Delay: 8s on all paths — gives user time to alt-tab back without cover.
-  // ESC key always toggles cover mode manually (handled in handleKeyDown).
+  // Dual-signal: Signal A = visibilitychange, Signal B = blur + mouseleave compound.
   useEffect(() => {
     if (!capabilities.autoStealth) return;
 
-    // Track mouse-in-window state for compound blur detection
     let mouseInWindow = true;
 
     const handleMouseEnter = () => { mouseInWindow = true; };
     const handleMouseLeave = () => { mouseInWindow = false; };
 
-    // Signal A: genuine tab switch or minimize
     const handleVis = () => {
       if (document.hidden) {
         if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
@@ -401,17 +497,13 @@ export default function AlphaPage() {
       }
     };
 
-    // Signal B: blur + mouse-left-window = macOS Cmd+Tab to another app
     const handleBlur = () => {
       if (!mouseInWindow) {
-        // Mouse already left the viewport — this is a real app switch
         if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
         stealthTimerRef.current = setTimeout(() => setCoverMode(true), 8000);
       }
-      // blur with mouse still in window = clicking devtools/taskbar — ignore
     };
 
-    // Any focus recovery clears cover immediately
     const handleFocus = () => {
       mouseInWindow = true;
       if (stealthTimerRef.current) clearTimeout(stealthTimerRef.current);
@@ -444,10 +536,8 @@ export default function AlphaPage() {
   const latestQuestion = activeQuestion
     || (transcripts.length > 0 ? transcripts[transcripts.length - 1].text : null);
 
-  // Real-time phase from transcript (no 60s wait)
   const realtimePhase = detectPhaseFromTranscript(transcripts);
 
-  // Force-agent indicator
   const forceAgentLabel: Record<NonNullable<ForceAgent>, string> = {
     terminal: 'T TERMINAL',
     rescue: 'R RESCUE',
@@ -458,136 +548,152 @@ export default function AlphaPage() {
   if (coverMode) return <CoverPage />;
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-sans">
-      {/* Overlays */}
-      {showHotkeys && <HotkeyOverlay onClose={() => setShowHotkeys(false)} />}
-
-      <RamblingBanner speakingStartRef={speakingStartRef} />
-
-      <StatusBar
-        status={mergedStatus}
-        isStreaming={isStreaming}
-        held={held}
-        profilerState={profilerState}
-        copilotLatency={alphaState.latency.totalMs ?? 0}
-        turnCount={metrics.turnCount}
-        currentAgent={alphaState.agent || undefined}
-        sessionStartTime={sessionStartTime}
-      />
-
-      <ControlBar
-        isStreaming={isStreaming}
-        isPaused={isPaused}
-        hasHistory={bulletHistory.length > 0}
-        followUpLoading={followUpLoading}
-        modesOpen={modesOpen}
-        onStart={start}
-        onStop={stop}
-        onPause={pause}
-        onResume={resume}
-        onRescue={emergencyRescue}
-        onGenerateFollowUp={generateFollowUp}
-        onToggleModes={() => setModesOpen(m => !m)}
-      />
-
-      {/* Force-agent indicator */}
-      {forceAgent && (
-        <div className="px-4 py-1.5 bg-yellow-950/60 border-b border-yellow-800 text-xs text-yellow-400 font-mono flex items-center gap-2">
-          <span className="animate-pulse">⚡</span>
-          <span>Force mode: {forceAgentLabel[forceAgent]}</span>
-          <button onClick={() => setForceAgent(null)} className="ml-auto text-yellow-700 hover:text-yellow-500">✕ clear</button>
-        </div>
-      )}
-
-      {/* Real-time phase detection banner */}
-      {realtimePhase && realtimePhase !== (profilerState?.conversation_phase ?? '') && (
-        <div className="px-4 py-1 bg-zinc-900/80 border-b border-zinc-800 text-xs text-zinc-500 flex items-center gap-2">
-          <span className="text-zinc-700">Phase detected:</span>
-          <span className="text-cyan-600 font-mono">{realtimePhase.replace(/_/g, ' ')}</span>
-        </div>
-      )}
-
-      <CapabilityPanel
-        capabilities={capabilities}
-        onToggle={toggleCapability}
-        isOpen={modesOpen}
-        isStreaming={isStreaming}
-      />
-
-      {/* Profiler panel */}
-      {showProfiler && (
-        <ProfilerPanel
-          profilerState={profilerState}
-          transcripts={transcripts}
-          sessionDurationSec={metrics.sessionDuration}
-          onExport={exportProfiler}
+    <>
+      {/* ── Root-level rescue overlay portal ──────────────────────────────
+          Rendered OUTSIDE the main div — no scroll/overflow ancestor.
+          CSS position:fixed works correctly here.
+          Previously this was inside ConversationTurn → overflow-y-auto
+          which clipped the fixed positioning and caused the broken overlay. */}
+      {rescueOverlayActive && (
+        <RescueOverlay
+          rescue={rescueText}
+          pivot={pivotText}
+          isStreaming={alphaState.isStreaming}
+          onDismiss={handleRescueDismiss}
         />
       )}
 
-      {error && (
-        <div className="mx-4 mt-3 px-4 py-3 bg-red-950/40 border border-red-800 rounded-xl text-sm text-red-300">
-          ⚠ {error}
-        </div>
-      )}
+      <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-sans">
+        {/* Overlays */}
+        {showHotkeys && <HotkeyOverlay onClose={() => setShowHotkeys(false)} />}
 
-      {/* Mode selector + session setup */}
-      <div className="px-4 pt-4 space-y-3">
-        <ModeSelector mode={mode} onChange={handleModeChange} disabled={isStreaming} />
-        <SessionSetup
-          onContextReady={setSessionContext}
+        <RamblingBanner speakingStartRef={speakingStartRef} />
+
+        <StatusBar
+          status={mergedStatus}
           isStreaming={isStreaming}
-          sessionContext={sessionContext}
+          held={held}
+          profilerState={profilerState}
+          copilotLatency={alphaState.latency.totalMs ?? 0}
+          turnCount={metrics.turnCount}
+          currentAgent={alphaState.agent || undefined}
+          sessionStartTime={sessionStartTime}
         />
-      </div>
 
-      {/* Scrollable conversation thread */}
-      <div ref={threadRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
-        {bulletHistory.length === 0 && !isActivelyStreaming && !partialText && (
-          <div className="text-center text-zinc-700 text-sm py-16 space-y-2">
-            <p className="text-zinc-500">
-              {isStreaming ? 'Listening — speak or play audio.' : 'Click START, then speak or play audio.'}
-            </p>
-            <p className="text-xs">
-              {isStreaming ? 'HUD appears after each turn.' : 'Press ? for keyboard shortcuts.'}
-            </p>
+        <ControlBar
+          isStreaming={isStreaming}
+          isPaused={isPaused}
+          hasHistory={bulletHistory.length > 0}
+          followUpLoading={followUpLoading}
+          modesOpen={modesOpen}
+          onStart={start}
+          onStop={stop}
+          onPause={pause}
+          onResume={resume}
+          onRescue={emergencyRescue}
+          onGenerateFollowUp={generateFollowUp}
+          onToggleModes={() => setModesOpen(m => !m)}
+        />
+
+        {/* Force-agent indicator */}
+        {forceAgent && (
+          <div className="px-4 py-1.5 bg-yellow-950/60 border-b border-yellow-800 text-xs text-yellow-400 font-mono flex items-center gap-2">
+            <span className="animate-pulse">⚡</span>
+            <span>Force mode: {forceAgentLabel[forceAgent]}</span>
+            <button onClick={() => setForceAgent(null)} className="ml-auto text-yellow-700 hover:text-yellow-500">✕ clear</button>
           </div>
         )}
 
-        {showHUD && <HistoricalThread bulletHistory={bulletHistory} />}
+        {/* Real-time phase detection banner */}
+        {realtimePhase && realtimePhase !== (profilerState?.conversation_phase ?? '') && (
+          <div className="px-4 py-1 bg-zinc-900/80 border-b border-zinc-800 text-xs text-zinc-500 flex items-center gap-2">
+            <span className="text-zinc-700">Phase detected:</span>
+            <span className="text-cyan-600 font-mono">{realtimePhase.replace(/_/g, ' ')}</span>
+          </div>
+        )}
 
-        {showHUD && (
-          <ActiveTurn
-            question={latestQuestion ?? null}
-            rawResponse={alphaState.insight}
-            partialText={partialText}
-            isActive={isActivelyStreaming}
-            meta={{
-              agent: alphaState.agent || 'tactical',
-              urgency: alphaState.urgency,
-              firstTokenMs: alphaState.latency.firstTokenMs,
-              truncated: alphaState.truncated,
-              isStreaming: alphaState.isStreaming,
-            }}
+        <CapabilityPanel
+          capabilities={capabilities}
+          onToggle={toggleCapability}
+          isOpen={modesOpen}
+          isStreaming={isStreaming}
+        />
+
+        {/* Profiler panel */}
+        {showProfiler && (
+          <ProfilerPanel
+            profilerState={profilerState}
+            transcripts={transcripts}
+            sessionDurationSec={metrics.sessionDuration}
+            onExport={exportProfiler}
           />
         )}
 
-        {!showHUD && isActivelyStreaming && (
-          <div className="text-center text-zinc-700 text-xs py-4">HUD hidden — press H to show</div>
+        {error && (
+          <div className="mx-4 mt-3 px-4 py-3 bg-red-950/40 border border-red-800 rounded-xl text-sm text-red-300">
+            ⚠ {error}
+          </div>
         )}
-      </div>
 
-      {/* Latency debug strip */}
-      {(alphaState.latency.routeMs || alphaState.latency.firstTokenMs) && (
-        <div className="px-4 pb-1 text-xs text-zinc-800 font-mono flex gap-4">
-          {alphaState.latency.routeMs && <span>route {alphaState.latency.routeMs}ms</span>}
-          {alphaState.latency.firstTokenMs && <span>first-token {alphaState.latency.firstTokenMs}ms</span>}
-          {alphaState.latency.totalMs && <span>total {alphaState.latency.totalMs}ms</span>}
+        {/* Mode selector + session setup */}
+        <div className="px-4 pt-4 space-y-3">
+          <ModeSelector mode={mode} onChange={handleModeChange} disabled={isStreaming} />
+          <SessionSetup
+            onContextReady={setSessionContext}
+            isStreaming={isStreaming}
+            sessionContext={sessionContext}
+          />
         </div>
-      )}
 
-      <div className="px-4 pb-4">
-        <FollowUpPanel followUp={followUp} onCopy={copyFollowUp} />
+        {/* Scrollable conversation thread */}
+        <div ref={threadRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+          {bulletHistory.length === 0 && !isActivelyStreaming && !partialText && (
+            <div className="text-center text-zinc-700 text-sm py-16 space-y-2">
+              <p className="text-zinc-500">
+                {isStreaming ? 'Listening — speak or play audio.' : 'Click START, then speak or play audio.'}
+              </p>
+              <p className="text-xs">
+                {isStreaming ? 'HUD appears after each turn.' : 'Press ? for keyboard shortcuts.'}
+              </p>
+            </div>
+          )}
+
+          {showHUD && <HistoricalThread bulletHistory={bulletHistory} />}
+
+          {showHUD && (
+            <ActiveTurn
+              question={latestQuestion ?? null}
+              rawResponse={alphaState.insight}
+              partialText={partialText}
+              isActive={isActivelyStreaming}
+              meta={{
+                agent: alphaState.agent || 'tactical',
+                urgency: alphaState.urgency,
+                firstTokenMs: alphaState.latency.firstTokenMs,
+                truncated: alphaState.truncated,
+                isStreaming: alphaState.isStreaming,
+              }}
+            />
+          )}
+
+          {!showHUD && isActivelyStreaming && (
+            <div className="text-center text-zinc-700 text-xs py-4">HUD hidden — press H to show</div>
+          )}
+        </div>
+
+        {/* Latency debug strip */}
+        {(alphaState.latency.routeMs || alphaState.latency.firstTokenMs) && (
+          <div className="px-4 pb-1 text-xs text-zinc-800 font-mono flex gap-4">
+            {alphaState.latency.routeMs && <span>route {alphaState.latency.routeMs}ms</span>}
+            {alphaState.latency.firstTokenMs && <span>first-token {alphaState.latency.firstTokenMs}ms</span>}
+            {alphaState.latency.totalMs && <span>total {alphaState.latency.totalMs}ms</span>}
+          </div>
+        )}
+
+        <div className="px-4 pb-4">
+          <FollowUpPanel followUp={followUp} onCopy={copyFollowUp} />
+        </div>
       </div>
-    </div>
+    </>
   );
 }
