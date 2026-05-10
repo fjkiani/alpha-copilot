@@ -74,58 +74,96 @@ function PivotBanner({
 
 // ── Rescue overlay ────────────────────────────────────────────────────────────
 // Rendered at JSX root — outside all scroll/overflow ancestors.
+// rawText is shown immediately during streaming before [RESCUE] header arrives.
+// parsed sections are shown once the model outputs the structured headers.
 function RescueOverlay({
   parsed,
+  rawText,
   isStreaming,
   onDismiss,
 }: {
   parsed: ReturnType<typeof parseHUDSections>;
+  rawText: string;
   isStreaming: boolean;
   onDismiss: () => void;
 }) {
+  // Strip section headers from raw text for the fallback display
+  const cleanRaw = rawText
+    .replace(/\[RESCUE\]/gi, '')
+    .replace(/\[FULL ANSWER\]/gi, '')
+    .replace(/\[CODE\]/gi, '')
+    .replace(/\[PIVOT\]/gi, '')
+    .trim();
+
+  const hasStructured = parsed?.phase === 'rescue' && (parsed.rescue || parsed.fullAnswer);
+
   return (
-    <div className="fixed inset-0 z-50 bg-zinc-950/95 flex flex-col items-center justify-center p-8 backdrop-blur-sm">
-      <div className="max-w-2xl w-full space-y-6">
+    <div className="fixed inset-0 z-50 bg-zinc-950/97 flex flex-col items-center justify-center p-8 backdrop-blur-sm">
+      <div className="max-w-2xl w-full space-y-5">
+
+        {/* Header */}
         <div className="flex items-center gap-3">
-          <span className="text-red-500 text-2xl animate-pulse">🆘</span>
-          <span className="text-red-400 text-sm font-semibold uppercase tracking-widest">Rescue Mode</span>
+          <span className="text-red-500 text-xl">🆘</span>
+          <span className="text-red-400 text-xs font-semibold uppercase tracking-widest">Rescue Mode</span>
           {isStreaming && (
-            <span className="ml-auto text-xs text-green-500 animate-pulse font-mono">streaming...</span>
+            <span className="ml-auto text-xs text-green-500 animate-pulse font-mono">generating...</span>
           )}
+          <button
+            onClick={onDismiss}
+            className="ml-auto text-zinc-600 hover:text-zinc-400 text-xs px-2 py-1 rounded"
+          >
+            ESC
+          </button>
         </div>
 
-        {parsed?.rescue ? (
-          <div className="bg-red-950/60 border border-red-700 rounded-xl p-6">
-            <p className="text-white text-2xl font-bold leading-tight">{parsed.rescue}</p>
-          </div>
+        {/* Structured view — shown once [RESCUE] header arrives */}
+        {hasStructured ? (
+          <>
+            {parsed?.rescue && (
+              <div className="bg-red-950/60 border border-red-700 rounded-xl p-5">
+                <p className="text-xs text-red-500 uppercase tracking-wider mb-2 font-semibold">Say this</p>
+                <p className="text-white text-xl font-bold leading-snug">{parsed.rescue}</p>
+              </div>
+            )}
+
+            {parsed?.fullAnswer && (
+              <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-5">
+                <p className="text-xs text-zinc-500 uppercase tracking-wider mb-2">Full answer</p>
+                <p className="text-zinc-200 text-base leading-relaxed">{parsed.fullAnswer}</p>
+              </div>
+            )}
+
+            {parsed?.rescueCode && (
+              <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-4">
+                <p className="text-xs text-zinc-500 uppercase tracking-wider mb-2">Code</p>
+                <pre className="text-green-400 text-sm overflow-x-auto whitespace-pre-wrap">{parsed.rescueCode}</pre>
+              </div>
+            )}
+
+            {parsed?.pivot && (
+              <div className="border-l-2 border-zinc-700 pl-4">
+                <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Then pivot to</p>
+                <p className="text-zinc-300 text-sm">{parsed.pivot}</p>
+              </div>
+            )}
+          </>
         ) : (
-          <div className="bg-red-950/30 border border-red-900 rounded-xl p-6 animate-pulse">
-            <div className="h-8 bg-red-900/40 rounded w-3/4" />
-          </div>
-        )}
-
-        {parsed?.fullAnswer && (
-          <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-5">
-            <p className="text-xs text-zinc-500 uppercase tracking-wider mb-2">Full answer</p>
-            <p className="text-zinc-200 text-lg leading-relaxed">{parsed.fullAnswer}</p>
-          </div>
-        )}
-
-        {parsed?.rescueCode && (
-          <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-4">
-            <pre className="text-green-400 text-sm overflow-x-auto">{parsed.rescueCode}</pre>
-          </div>
-        )}
-
-        {parsed?.pivot && (
-          <div className="border-l-2 border-zinc-700 pl-4">
-            <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Then pivot to</p>
-            <p className="text-zinc-300">{parsed.pivot}</p>
+          /* Raw streaming fallback — shown immediately while model is generating */
+          <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-5 min-h-[120px]">
+            {cleanRaw ? (
+              <p className="text-zinc-200 text-base leading-relaxed whitespace-pre-wrap">{cleanRaw}</p>
+            ) : (
+              <div className="space-y-3 animate-pulse">
+                <div className="h-5 bg-zinc-800 rounded w-3/4" />
+                <div className="h-5 bg-zinc-800 rounded w-full" />
+                <div className="h-5 bg-zinc-800 rounded w-2/3" />
+              </div>
+            )}
           </div>
         )}
 
         <p className="text-xs text-zinc-700 text-center">
-          {isStreaming ? 'Generating...' : 'Press SPACE or ESC to dismiss'}
+          {isStreaming ? 'Generating rescue...' : 'Press SPACE or ESC to dismiss'}
         </p>
 
         {!isStreaming && (
@@ -395,9 +433,14 @@ export default function AlphaPage() {
 
     if (inInput) return;
 
-    if (e.code === 'Space' && orchestrator.rescueActive) {
+    if (e.code === 'Space') {
       e.preventDefault();
-      orchestrator.dismissRescue();
+      if (orchestrator.rescueActive) {
+        orchestrator.dismissRescue();
+      } else if (isStreaming && !orchestrator.isStreaming) {
+        // SPACE = trigger rescue when streaming (candidate is speaking)
+        orchestrator.triggerRescue();
+      }
       return;
     }
 
@@ -476,6 +519,7 @@ export default function AlphaPage() {
       {orchestrator.rescueActive && (
         <RescueOverlay
           parsed={orchestrator.rescueParsed}
+          rawText={orchestrator.rescueRaw}
           isStreaming={orchestrator.isStreaming}
           onDismiss={orchestrator.dismissRescue}
         />
@@ -507,7 +551,7 @@ export default function AlphaPage() {
           onStop={handleStop}
           onPause={pause}
           onResume={resume}
-          onRescue={emergencyRescue}
+          onRescue={() => orchestrator.triggerRescue()}
           onGenerateFollowUp={generateFollowUp}
           onToggleModes={() => setModesOpen(m => !m)}
         />

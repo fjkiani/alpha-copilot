@@ -13,6 +13,7 @@
  *   4. Run /api/monitor in parallel with candidate speaking
  *   5. Fire /api/pivot if monitor raises shouldPivot
  *   6. Expose phase banner state for UI
+ *   7. triggerRescue() — bypasses conductor, fires /api/rescue directly (RESCUE button)
  */
 'use client';
 
@@ -24,6 +25,7 @@ import {
   addTurn,
   startCandidateTurn,
   appendAnswerDraft,
+  buildConversationContext,
   type SessionState,
   type MonitorFlag,
   type InterviewPhase,
@@ -53,6 +55,7 @@ export interface OrchestratorState {
   pivotParsed: HUDParsed | null;
   rescueActive: boolean;
   rescueParsed: HUDParsed | null;
+  rescueRaw: string;           // raw accumulated rescue text — shown immediately during streaming
   monitorFlags: MonitorFlag[];
   briefing: string;
   error: string | null;
@@ -63,6 +66,7 @@ export interface OrchestratorActions {
   startSession: (context: string) => Promise<void>;
   submitUtterance: (utterance: string) => Promise<void>;
   submitTranscript: (transcript: string, speakingSeconds: number) => Promise<void>;
+  triggerRescue: (context?: string) => Promise<void>;  // direct rescue bypass
   dismissPivot: () => void;
   dismissRescue: () => void;
   reset: () => void;
@@ -86,6 +90,7 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
   const [pivotParsed, setPivotParsed] = useState<HUDParsed | null>(null);
   const [rescueActive, setRescueActive] = useState(false);
   const [rescueParsed, setRescueParsed] = useState<HUDParsed | null>(null);
+  const [rescueRaw, setRescueRaw] = useState('');
   const [monitorFlags, setMonitorFlags] = useState<MonitorFlag[]>([]);
   const [briefing, setBriefing] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -156,6 +161,49 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
     onDone(accumulated);
   }, []);
 
+  // ── Rescue stream helper — shared by triggerRescue and submitUtterance ─────
+
+  const streamRescue = useCallback(async (
+    body: object,
+    signal: AbortSignal
+  ) => {
+    setStatus('rescuing');
+    setRescueActive(true);
+    setRescueParsed(null);
+    setRescueRaw('');
+    setIsStreaming(true);
+
+    await consumeSSE(
+      '/api/rescue',
+      body,
+      (_chunk, accumulated) => {
+        // Always update raw text immediately — shown in overlay before [RESCUE] header arrives
+        setRescueRaw(accumulated);
+        // Also try to parse structured sections
+        const parsed = parseHUDSections(accumulated);
+        if (parsed && parsed.phase === 'rescue') {
+          setRescueParsed(parsed);
+        }
+      },
+      (full) => {
+        setIsStreaming(false);
+        setRescueRaw(full);
+        const parsed = parseHUDSections(full);
+        setRescueParsed(parsed && parsed.phase === 'rescue' ? parsed : null);
+
+        // Auto-dismiss after 10s
+        if (rescueDismissTimerRef.current) clearTimeout(rescueDismissTimerRef.current);
+        rescueDismissTimerRef.current = setTimeout(() => {
+          setRescueActive(false);
+          setRescueParsed(null);
+          setRescueRaw('');
+          setStatus('ready');
+        }, 10000);
+      },
+      signal
+    );
+  }, [consumeSSE]);
+
   // ── Preflight ──────────────────────────────────────────────────────────────
 
   const startSession = useCallback(async (context: string) => {
@@ -188,10 +236,44 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
       setStatus('ready');
     } catch (err) {
       console.error('[orchestrator] preflight error:', err);
-      setError('Preflight failed. Check your connection and try again.');
-      setStatus('error');
+      // Don't block the user — fall through to ready state
+      setStatus('ready');
     }
   }, [cancelActive, updateSession]);
+
+  // ── Direct rescue trigger (RESCUE button / SPACE hotkey) ──────────────────
+  // Bypasses conductor entirely. Reads session context directly.
+
+  const triggerRescue = useCallback(async (context?: string) => {
+    cancelActive();
+
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
+    const conversationContext = buildConversationContext(sessionRef.current, 10);
+    const utterance = context
+      || sessionRef.current.activeQuestion
+      || 'Candidate needs full rescue — provide complete answer';
+
+    const body = {
+      session: serializeForTransport(sessionRef.current),
+      utterance,
+      conductorPlan: 'Emergency rescue — provide complete verbatim answer immediately',
+      matchedQuestion: null,
+      conversationContext,
+    };
+
+    try {
+      await streamRescue(body, ctrl.signal);
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        console.error('[orchestrator] rescue error:', err);
+        setError('Rescue failed. Try again.');
+        setStatus('ready');
+      }
+      setIsStreaming(false);
+    }
+  }, [cancelActive, streamRescue]);
 
   // ── Conductor + agent routing ──────────────────────────────────────────────
 
@@ -233,7 +315,6 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
       });
       conductorResult = await res.json();
     } catch {
-      // Fallback — route to answer agent
       conductorResult = {
         phase: sessionRef.current.phase,
         phaseChanged: false,
@@ -249,7 +330,6 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
       updateSession({ phase: conductorResult.phase });
       setPhase(conductorResult.phase);
       setPhaseChanged(true);
-      // Auto-clear phase banner after 4s
       setTimeout(() => setPhaseChanged(false), 4000);
     }
 
@@ -260,21 +340,44 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
 
     // Step 2: Route to correct agent
     const agentType = conductorResult.urgency === 'rescue' ? 'rescue' : conductorResult.agentType;
-    const endpoint = agentType === 'code' ? '/api/code'
-      : agentType === 'rescue' ? '/api/rescue'
-      : agentType === 'pivot' ? '/api/pivot'
-      : '/api/answer';
-
     const isRescue = agentType === 'rescue';
     const isPivot = agentType === 'pivot';
 
-    if (isRescue) { setStatus('rescuing'); setRescueActive(true); setRescueParsed(null); }
-    else if (isPivot) { setStatus('pivoting'); setPivotActive(true); setPivotParsed(null); }
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
+    if (isRescue) {
+      // Use shared rescue streamer
+      const body = {
+        session: serializeForTransport(sessionRef.current),
+        utterance,
+        conductorPlan: conductorResult.conductorPlan,
+        matchedQuestion: matchedQuestion ? {
+          question: matchedQuestion.question,
+          skeleton: matchedQuestion.skeleton,
+          keyMechanism: matchedQuestion.keyMechanism,
+        } : null,
+      };
+      try {
+        await streamRescue(body, ctrl.signal);
+      } catch (err) {
+        if ((err as Error).name !== 'AbortError') {
+          setError('Rescue failed.');
+          setStatus('ready');
+        }
+        setIsStreaming(false);
+      }
+      return;
+    }
+
+    const endpoint = agentType === 'code' ? '/api/code'
+      : isPivot ? '/api/pivot'
+      : '/api/answer';
+
+    if (isPivot) { setStatus('pivoting'); setPivotActive(true); setPivotParsed(null); }
     else { setStatus('answering'); }
 
     setIsStreaming(true);
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
 
     const requestBody = {
       session: serializeForTransport(sessionRef.current),
@@ -297,10 +400,7 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
         endpoint,
         requestBody,
         (_chunk, accumulated) => {
-          if (isRescue) {
-            const parsed = parseHUDSections(accumulated);
-            setRescueParsed(parsed);
-          } else if (isPivot) {
+          if (isPivot) {
             const parsed = parseHUDSections(accumulated);
             setPivotParsed(parsed);
           } else {
@@ -313,19 +413,9 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
           setIsStreaming(false);
           setStatus('ready');
 
-          if (isRescue) {
-            const parsed = parseHUDSections(full);
-            setRescueParsed(parsed);
-            // Auto-dismiss rescue after 8s
-            if (rescueDismissTimerRef.current) clearTimeout(rescueDismissTimerRef.current);
-            rescueDismissTimerRef.current = setTimeout(() => {
-              setRescueActive(false);
-              setRescueParsed(null);
-            }, 8000);
-          } else if (isPivot) {
+          if (isPivot) {
             const parsed = parseHUDSections(full);
             setPivotParsed(parsed);
-            // Auto-dismiss pivot after 5s
             if (pivotDismissTimerRef.current) clearTimeout(pivotDismissTimerRef.current);
             pivotDismissTimerRef.current = setTimeout(() => {
               setPivotActive(false);
@@ -336,7 +426,6 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
             setHudParsed(parseHUDSections(full));
           }
 
-          // Record agent response in session
           sessionRef.current = addTurn(
             sessionRef.current,
             'candidate',
@@ -355,17 +444,15 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
       }
       setIsStreaming(false);
     }
-  }, [cancelActive, updateSession, consumeSSE]);
+  }, [cancelActive, updateSession, consumeSSE, streamRescue]);
 
-  // ── Monitor (called by parent on transcript updates) ───────────────────────
+  // ── Monitor ────────────────────────────────────────────────────────────────
 
   const submitTranscript = useCallback(async (transcript: string, speakingSeconds: number) => {
     if (!transcript.trim() || status !== 'ready') return;
 
-    // Update answer draft
     sessionRef.current = appendAnswerDraft(sessionRef.current, transcript);
 
-    // Cancel previous monitor call
     monitorAbortRef.current?.abort();
     const ctrl = new AbortController();
     monitorAbortRef.current = ctrl;
@@ -395,7 +482,6 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
         setMonitorFlags(prev => [...prev, ...flags]);
       }
 
-      // Fire pivot if monitor says so
       if (data.shouldPivot && !pivotActive) {
         setPivotActive(true);
         setStatus('pivoting');
@@ -444,10 +530,13 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
 
   const dismissRescue = useCallback(() => {
     if (rescueDismissTimerRef.current) clearTimeout(rescueDismissTimerRef.current);
+    cancelActive();
     setRescueActive(false);
     setRescueParsed(null);
+    setRescueRaw('');
+    setIsStreaming(false);
     if (status === 'rescuing') setStatus('ready');
-  }, [status]);
+  }, [status, cancelActive]);
 
   const reset = useCallback(() => {
     cancelActive();
@@ -462,6 +551,7 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
     setPivotParsed(null);
     setRescueActive(false);
     setRescueParsed(null);
+    setRescueRaw('');
     setMonitorFlags([]);
     setBriefing('');
     setError(null);
@@ -479,6 +569,7 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
     pivotParsed,
     rescueActive,
     rescueParsed,
+    rescueRaw,
     monitorFlags,
     briefing,
     error,
@@ -487,6 +578,7 @@ export function useOrchestrator(): OrchestratorState & OrchestratorActions {
     startSession,
     submitUtterance,
     submitTranscript,
+    triggerRescue,
     dismissPivot,
     dismissRescue,
     reset,
