@@ -1,76 +1,32 @@
 /**
- * profilerLoop.ts — Background profiler interval manager
+ * lib/profilerLoop.ts — STUB (v2)
  *
- * Runs every intervalMs (default 60s). Sends latest tagged transcripts
- * to /api/profiler and patches the profile state.
- * Zero React deps. Returns { start, stop, tick } controller.
+ * The profiler loop was a v1 feature that ran background LLM calls
+ * to detect conversation phase. In v2, phase detection is handled
+ * by the conductor agent (/api/conductor) on every turn.
+ *
+ * This stub exists only to satisfy the import in useTranscription.ts
+ * until that hook is refactored to remove the profiler dependency.
  */
 
 export interface ProfilerLoopOptions {
-  intervalMs?: number;
+  intervalMs: number;
   getTaggedTranscripts: () => string[];
   getLastTick: () => number;
   setLastTick: (n: number) => void;
-  getState: () => object | null;
-  onUpdate: (newState: object) => void;
-  baseUrl?: string;
+  getState: () => unknown;
+  onUpdate: (state: unknown) => void;
 }
 
 export interface ProfilerLoop {
   start: () => void;
   stop: () => void;
-  tick: () => Promise<void>;
 }
 
-export function createProfilerLoop({
-  intervalMs = 60000,
-  getTaggedTranscripts,
-  getLastTick,
-  setLastTick,
-  getState,
-  onUpdate,
-  baseUrl = '',
-}: ProfilerLoopOptions): ProfilerLoop {
-  let intervalId: ReturnType<typeof setInterval> | null = null;
-
-  async function tick(): Promise<void> {
-    const allTagged = getTaggedTranscripts();
-    const lastTick = getLastTick();
-    const latestChunk = allTagged.slice(lastTick);
-    setLastTick(allTagged.length);
-
-    if (latestChunk.length === 0) return;
-
-    try {
-      const res = await fetch(`${baseUrl}/api/profiler`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          currentProfileState: getState(),
-          latestChunk,
-        }),
-      });
-      if (res.ok) {
-        const newState = await res.json();
-        onUpdate(newState);
-        console.log('[profiler] Updated:', JSON.stringify(newState).slice(0, 100));
-      }
-    } catch (e) {
-      console.warn('[profiler] Error (non-fatal):', (e as Error).message);
-    }
-  }
-
+export function createProfilerLoop(_options: ProfilerLoopOptions): ProfilerLoop {
+  // No-op in v2 — conductor handles phase detection
   return {
-    start() {
-      if (intervalId) return;
-      intervalId = setInterval(tick, intervalMs);
-    },
-    stop() {
-      if (intervalId) {
-        clearInterval(intervalId);
-        intervalId = null;
-      }
-    },
-    tick,
+    start: () => {},
+    stop: () => {},
   };
 }

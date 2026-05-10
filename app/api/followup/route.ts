@@ -1,41 +1,60 @@
 /**
  * POST /api/followup
- * Post-Session Follow-Up Intelligence Generator
- * Streams a markdown follow-up brief via SSE.
  *
- * Accepts: { history: [...], profilerState: object|null }
+ * Post-session follow-up brief generator.
+ * Streams a markdown debrief via SSE.
+ *
+ * v2: No KB injection. No resume context. Pure session history analysis.
+ * Model: qwen-plus (fast, good at synthesis)
  */
-import { buildFollowUpPrompt, type ProfilerState, type KnowledgeBase } from '@/lib/buildSystemPrompt';
-import KB from '@/lib/knowledge_base.json';
-
 export const runtime = 'edge';
+
+const SYSTEM = `You are an expert interview debrief analyst.
+Given a transcript of an interview session (interviewer questions + AI HUD coaching responses),
+generate a concise post-session follow-up brief.
+
+OUTPUT FORMAT (markdown):
+## What Went Well
+- 2-3 specific moments where the candidate's approach was strong
+
+## Watch Out For
+- 2-3 patterns or gaps that could hurt in future rounds
+
+## Questions to Prepare
+- 3-5 follow-up questions the interviewer is likely to ask next time, based on what was covered
+
+## One Thing to Nail
+- The single most important concept or skill to sharpen before the next round. Be specific.
+
+RULES:
+- Be specific. Reference actual questions and topics from the transcript.
+- No generic advice. Every bullet must be grounded in what actually happened.
+- Max 300 words total.
+- No filler phrases.`;
 
 export async function POST(request: Request) {
   try {
-    const { history, profilerState } = (await request.json()) as {
+    const { history } = (await request.json()) as {
       history: Array<{ question: string; bullets?: string[]; rawResponse?: string }>;
-      profilerState: ProfilerState | null;
     };
 
     if (!history || history.length === 0) {
       return Response.json({ error: 'No conversation history to analyze' }, { status: 400 });
     }
 
-    const systemPrompt = buildFollowUpPrompt(KB as unknown as KnowledgeBase, profilerState);
-
     const transcript = history
       .map((h, i) => {
         const q = h.question ?? '(unknown question)';
         const a = h.rawResponse ?? (h.bullets ?? []).join('\n') ?? '(no response)';
-        return `--- Turn ${i + 1} ---\nInterviewer: ${q}\nAlpha's HUD Response:\n${a}`;
+        return `--- Turn ${i + 1} ---\nInterviewer: ${q}\nHUD Response:\n${a}`;
       })
       .join('\n\n');
 
     const messages = [
-      { role: 'system', content: systemPrompt },
+      { role: 'system', content: SYSTEM },
       {
         role: 'user',
-        content: `Here is the full interview transcript (${history.length} turns):\n\n${transcript}\n\nGenerate the follow-up brief now.`,
+        content: `Interview transcript (${history.length} turns):\n\n${transcript}\n\nGenerate the follow-up brief now.`,
       },
     ];
 
@@ -54,7 +73,7 @@ export async function POST(request: Request) {
         model: 'qwen/qwen-plus-2025-07-28',
         messages,
         temperature: 0.4,
-        max_tokens: 1500,
+        max_tokens: 1000,
         stream: true,
       }),
     });
